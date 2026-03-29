@@ -7,11 +7,17 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
 use std::time::SystemTime;
+use tokio::io::AsyncBufReadExt;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author, 
+    version, 
+    about = "High-performance pub/sub benchmarker",
+    after_help = "EXAMPLES:\n  Run HugiMQ benchmark:\n    cargo run --release -p benchmarker -- hugimq --connections 20 --messages-per-conn 50000\n\n  Run Redis benchmark:\n    cargo run --release -p benchmarker -- redis --connections 20 --messages-per-conn 50000\n\n  Test with 5KB payloads:\n    cargo run --release -p benchmarker -- hugimq --payload-size 5120"
+)]
 struct Args {
-    #[arg(value_enum, default_value_t = Target::Redis)]
+    #[arg(help = "The system to benchmark (redis or hugimq)")]
     target: Target,
 
     #[arg(short, long, default_value_t = 10)]
@@ -25,12 +31,16 @@ struct Args {
 
     #[arg(long, default_value = "redis://127.0.0.1/")]
     redis_url: String,
+
+    #[arg(long, default_value = "http://127.0.0.1:3000")]
+    hugimq_url: String,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+#[value(rename_all = "lowercase")]
 enum Target {
     Redis,
-    HugiMQ,
+    Hugimq,
 }
 
 #[tokio::main]
@@ -61,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = Vec::new();
     let payload = Arc::new("a".repeat(args.payload_size));
+    let client = Arc::new(reqwest::Client::new());
 
     println!("Spawning {} consumers and {} producers...", num_consumers, num_producers);
 
@@ -71,6 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let target = args.target;
         let e2e_hist = Arc::clone(&e2e_hist);
         let redis_url = args.redis_url.clone();
+        let hugimq_url = args.hugimq_url.clone();
+        let client = Arc::clone(&client);
         
         handles.push(tokio::spawn(async move {
             let mut local_e2e = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
@@ -104,7 +117,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                Target::HugiMQ => todo!("HugiMQ implementation pending"),
+                Target::Hugimq => {
+                    let mut response = client.get(format!("{}/subscribe/benchmark_topic", hugimq_url))
+                        .send()
+                        .await
+                        .unwrap()
+                        .bytes_stream();
+                    
+                    b.wait().await;
+                    sb.wait().await;
+                    
+                    let mut buffer = String::new();
+                    while let Some(chunk) = response.next().await {
+                        if let Ok(bytes) = chunk {
+                            let s = String::from_utf8_lossy(&bytes);
+                            buffer.push_str(&s);
+                            
+                            while let Some(pos) = buffer.find("\n\n") {
+                                let message = buffer[..pos].to_string();
+                                buffer = buffer[pos + 2..].to_string();
+                                
+                                for line in message.lines() {
+                                    if line.starts_with("data: ") {
+                                        let data = &line[6..];
+                                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                        
+                                        let parts: Vec<&str> = data.splitn(4, ':').collect();
+                                        if parts.len() >= 3 {
+                                            if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                                let latency = (now.saturating_sub(sent_at)) as u64;
+                                                let _ = local_e2e.record(latency);
+                                            }
+                                        }
+                                        
+                                        total_received.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                if total_received.load(Ordering::Relaxed) >= total_expected_deliveries {
+                                    break;
+                                }
+                            }
+                            if total_received.load(Ordering::Relaxed) >= total_expected_deliveries {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             let mut global_e2e = e2e_hist.lock().await;
             global_e2e.add(local_e2e).unwrap();
@@ -119,6 +177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let payload = Arc::clone(&payload);
         let pub_ack_hist = Arc::clone(&pub_ack_hist);
         let redis_url = args.redis_url.clone();
+        let hugimq_url = args.hugimq_url.clone();
+        let client = Arc::clone(&client);
 
         handles.push(tokio::spawn(async move {
             let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
@@ -140,7 +200,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = local_pub_ack.record(ack_latency);
                     }
                 }
-                Target::HugiMQ => todo!("HugiMQ implementation pending"),
+                Target::Hugimq => {
+                    b.wait().await;
+                    sb.wait().await;
+                    
+                    for seq in 0..msg_count {
+                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                        let msg = format!("{}:{}:{}:{}", prod_id, seq, now, payload);
+                        
+                        let ack_start = Instant::now();
+                        let resp = client.post(format!("{}/publish/benchmark_topic", hugimq_url))
+                            .json(&serde_json::json!({ "payload": msg }))
+                            .send()
+                            .await;
+                        
+                        if let Ok(resp) = resp {
+                            if resp.status().is_success() {
+                                let ack_latency = ack_start.elapsed().as_nanos() as u64;
+                                let _ = local_pub_ack.record(ack_latency);
+                            }
+                        }
+                    }
+                }
             }
             let mut global_pub_ack = pub_ack_hist.lock().await;
             global_pub_ack.add(local_pub_ack).unwrap();
