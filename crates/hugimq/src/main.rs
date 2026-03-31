@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc};
@@ -16,7 +17,7 @@ struct Message {
 }
 
 struct AppState {
-    tx: broadcast::Sender<Message>,
+    topics: DashMap<String, broadcast::Sender<Message>>,
 }
 
 #[tokio::main]
@@ -26,9 +27,9 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let (tx, _rx) = broadcast::channel(1024 * 64); // Large buffer for high throughput
-
-    let state = Arc::new(AppState { tx });
+    let state = Arc::new(AppState {
+        topics: DashMap::new(),
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -36,7 +37,7 @@ async fn main() {
         .route("/subscribe/:topic", get(subscribe))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:6379").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:6380").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
@@ -47,18 +48,26 @@ async fn health() -> &'static str {
 
 async fn publish(
     State(state): State<Arc<AppState>>,
-    Path(_topic): Path<String>,
+    Path(topic): Path<String>,
     Json(payload): Json<Message>,
 ) -> &'static str {
-    let _ = state.tx.send(payload);
+    let tx = state.topics.entry(topic).or_insert_with(|| {
+        let (tx, _rx) = broadcast::channel(1024 * 64);
+        tx
+    });
+    let _ = tx.send(payload);
     "OK"
 }
 
 async fn subscribe(
     State(state): State<Arc<AppState>>,
-    Path(_topic): Path<String>,
+    Path(topic): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let mut rx = state.tx.subscribe();
+    let tx = state.topics.entry(topic).or_insert_with(|| {
+        let (tx, _rx) = broadcast::channel(1024 * 64);
+        tx
+    });
+    let mut rx = tx.subscribe();
 
     let stream = async_stream::stream! {
         while let Ok(msg) = rx.recv().await {

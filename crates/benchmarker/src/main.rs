@@ -34,6 +34,9 @@ struct Args {
 
     #[arg(long, default_value = "http://127.0.0.1:6379")]
     hugimq_url: String,
+
+    #[arg(long, default_value_t = 1)]
+    topics: usize,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -52,14 +55,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("Target: {:?} | Connections: {} | Msg/Conn: {} | Payload: {} bytes", 
-             args.target, args.connections, args.messages_per_conn, args.payload_size);
+    println!("Target: {:?} | Connections: {} | Topics: {} | Msg/Conn: {} | Payload: {} bytes", 
+             args.target, args.connections, args.topics, args.messages_per_conn, args.payload_size);
 
     let num_producers = args.connections / 2;
     let num_consumers = args.connections - num_producers;
     
     let total_expected_messages = num_producers * args.messages_per_conn;
-    let total_expected_deliveries = (total_expected_messages * num_consumers) as u64;
+    
+    // Calculate total expected deliveries based on how topics are distributed.
+    // Each producer publishes to ONE topic. Each consumer subscribes to ONE topic.
+    // A message is delivered to all consumers on that topic.
+    let mut total_expected_deliveries = 0u64;
+    for p_id in 0..num_producers {
+        let topic_idx = p_id % args.topics;
+        let consumers_on_topic = (0..num_consumers).filter(|&c_id| c_id % args.topics == topic_idx).count();
+        total_expected_deliveries += (args.messages_per_conn * consumers_on_topic) as u64;
+    }
 
     let total_received = Arc::new(AtomicU64::new(0));
     
@@ -75,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Spawning {} consumers and {} producers...", num_consumers, num_producers);
 
-    for _ in 0..num_consumers {
+    for consumer_id in 0..num_consumers {
         let total_received = Arc::clone(&total_received);
         let b = Arc::clone(&barrier);
         let sb = Arc::clone(&start_barrier);
@@ -84,6 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
         let client = Arc::clone(&client);
+        let topic_name = if args.topics > 1 {
+            format!("benchmark_topic_{}", consumer_id % args.topics)
+        } else {
+            "benchmark_topic".to_string()
+        };
         
         handles.push(tokio::spawn(async move {
             let mut local_e2e = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
@@ -92,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let client = redis::Client::open(redis_url.as_str()).unwrap();
                     let con = client.get_async_connection().await.unwrap();
                     let mut pubsub = con.into_pubsub();
-                    pubsub.subscribe("benchmark_topic").await.unwrap();
+                    pubsub.subscribe(&topic_name).await.unwrap();
                     
                     b.wait().await;
                     sb.wait().await;
@@ -118,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Target::Hugimq => {
-                    let mut response = client.get(format!("{}/subscribe/benchmark_topic", hugimq_url))
+                    let mut response = client.get(format!("{}/subscribe/{}", hugimq_url, topic_name))
                         .send()
                         .await
                         .unwrap()
@@ -142,8 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let data = &line[6..];
                                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                                         
-                                        let parts: Vec<&str> = data.splitn(4, ':').collect();
-                                        if parts.len() >= 3 {
+                                        let parts: Vec<&str> = data.splitn(5, ':').collect();
+                                        if parts.len() >= 4 {
+                                            let received_topic = parts[3];
+                                            if received_topic != topic_name {
+                                                eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
+                                                std::process::exit(1);
+                                            }
+
                                             if let Ok(sent_at) = parts[2].parse::<u128>() {
                                                 let latency = (now.saturating_sub(sent_at)) as u64;
                                                 let _ = local_e2e.record(latency);
@@ -179,6 +202,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
         let client = Arc::clone(&client);
+        let topic_name = if args.topics > 1 {
+            format!("benchmark_topic_{}", prod_id % args.topics)
+        } else {
+            "benchmark_topic".to_string()
+        };
 
         handles.push(tokio::spawn(async move {
             let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
@@ -192,10 +220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     for seq in 0..msg_count {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                        let msg = format!("{}:{}:{}:{}", prod_id, seq, now, payload);
+                        let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
                         
                         let ack_start = Instant::now();
-                        let _: () = con.publish("benchmark_topic", msg).await.unwrap();
+                        let _: () = con.publish(&topic_name, msg).await.unwrap();
                         let ack_latency = ack_start.elapsed().as_nanos() as u64;
                         let _ = local_pub_ack.record(ack_latency);
                     }
@@ -206,10 +234,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     for seq in 0..msg_count {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                        let msg = format!("{}:{}:{}:{}", prod_id, seq, now, payload);
+                        let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
                         
                         let ack_start = Instant::now();
-                        let resp = client.post(format!("{}/publish/benchmark_topic", hugimq_url))
+                        let resp = client.post(format!("{}/publish/{}", hugimq_url, topic_name))
                             .json(&serde_json::json!({ "payload": msg }))
                             .send()
                             .await;
