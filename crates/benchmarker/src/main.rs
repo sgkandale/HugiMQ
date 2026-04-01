@@ -7,7 +7,13 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
 use std::time::SystemTime;
-use tokio::io::AsyncBufReadExt;
+use rmp_serde::to_vec;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Message {
+    payload: String,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -235,10 +241,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for seq in 0..msg_count {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
-                        
+
                         let ack_start = Instant::now();
+                        let payload_bytes = to_vec(&Message { payload: msg }).unwrap();
                         let resp = client.post(format!("{}/publish/{}", hugimq_url, topic_name))
-                            .json(&serde_json::json!({ "payload": msg }))
+                            .body(payload_bytes)
                             .send()
                             .await;
                         

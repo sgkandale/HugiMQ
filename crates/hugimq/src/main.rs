@@ -1,11 +1,14 @@
 use axum::{
+    body::Bytes,
     extract::{Path, State},
+    http::StatusCode,
     response::sse::{Event, Sse},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use dashmap::DashMap;
 use futures::stream::Stream;
+use rmp_serde::from_slice;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc};
 use tokio::sync::broadcast;
@@ -49,14 +52,15 @@ async fn health() -> &'static str {
 async fn publish(
     State(state): State<Arc<AppState>>,
     Path(topic): Path<String>,
-    Json(payload): Json<Message>,
-) -> &'static str {
+    bytes: Bytes,
+) -> Result<&'static str, StatusCode> {
+    let payload: Message = from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
     let tx = state.topics.entry(topic).or_insert_with(|| {
         let (tx, _rx) = broadcast::channel(1024 * 64);
         tx
     });
     let _ = tx.send(payload);
-    "OK"
+    Ok("OK")
 }
 
 async fn subscribe(
