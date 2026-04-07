@@ -38,7 +38,7 @@ struct Args {
     #[arg(long, default_value = "redis://127.0.0.1/")]
     redis_url: String,
 
-    #[arg(long, default_value = "http://127.0.0.1:6380")]
+    #[arg(long, default_value = "http://127.0.0.1:6379")]
     hugimq_url: String,
 
     #[arg(long, default_value_t = 1)]
@@ -176,11 +176,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Target::Hugimq => {
                     let mut client = HugiMqServiceClient::connect(hugimq_url.to_string()).await.unwrap();
-                    b.wait().await;
-                    sb.wait().await;
 
+                    // Subscribe BEFORE the barriers so we're ready when producers start.
+                    // This mirrors the Redis consumer which also subscribes before the barriers.
                     let response = client.subscribe(SubscribeRequest { topic: topic_name.clone() }).await.unwrap();
                     let mut stream = response.into_inner();
+
+                    b.wait().await;
+                    sb.wait().await;
 
                     while received_by_this_consumer < expected_for_this_consumer {
                         match tokio::time::timeout(Duration::from_secs(5), stream.try_next()).await {
