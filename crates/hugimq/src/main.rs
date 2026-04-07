@@ -1,26 +1,81 @@
-use axum::{
-    body::Bytes,
-    extract::{Path, State},
-    http::StatusCode,
-    response::sse::{Event, Sse},
-    routing::{get, post},
-    Router,
-};
+pub mod hugimq {
+    tonic::include_proto!("hugimq");
+}
+
 use dashmap::DashMap;
 use futures::stream::Stream;
-use rmp_serde::from_slice;
-use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, sync::Arc};
+use hugimq::hugi_mq_service_server::{HugiMqService, HugiMqServiceServer};
+use hugimq::{PublishRequest, PublishResponse, SubscribeRequest, SubscribeResponse};
+use std::{pin::Pin, sync::Arc};
 use tokio::sync::broadcast;
+use tonic::{transport::Server, Request, Response, Status};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 struct Message {
     payload: String,
 }
 
 struct AppState {
     topics: DashMap<String, broadcast::Sender<Message>>,
+}
+
+pub struct HugiMQServer {
+    state: Arc<AppState>,
+}
+
+#[tonic::async_trait]
+impl HugiMqService for HugiMQServer {
+    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<SubscribeResponse, Status>> + Send>>;
+
+    async fn publish(
+        &self,
+        request: Request<PublishRequest>,
+    ) -> Result<Response<PublishResponse>, Status> {
+        let req = request.into_inner();
+        let topic = req.topic;
+        let payload = Message { payload: req.payload };
+
+        let tx = self.state.topics.entry(topic).or_insert_with(|| {
+            let (tx, _rx) = broadcast::channel(1024 * 256);
+            tx
+        });
+        let _ = tx.send(payload);
+        Ok(Response::new(PublishResponse { ok: true }))
+    }
+
+    async fn subscribe(
+        &self,
+        request: Request<SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let req = request.into_inner();
+        let topic = req.topic;
+
+        let tx = self.state.topics.entry(topic).or_insert_with(|| {
+            let (tx, _rx) = broadcast::channel(1024 * 256);
+            tx
+        });
+        let mut rx = tx.subscribe();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        yield Ok(SubscribeResponse { payload: msg.payload });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Consumer lagged by {} messages", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 #[tokio::main]
@@ -34,50 +89,14 @@ async fn main() {
         topics: DashMap::new(),
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/publish/:topic", post(publish))
-        .route("/subscribe/:topic", get(subscribe))
-        .with_state(state);
+    let server = HugiMQServer { state };
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:6379").await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
-}
+    let addr = "0.0.0.0:6380".parse().unwrap();
+    tracing::info!("listening on {}", addr);
 
-async fn health() -> &'static str {
-    "OK"
-}
-
-async fn publish(
-    State(state): State<Arc<AppState>>,
-    Path(topic): Path<String>,
-    bytes: Bytes,
-) -> Result<&'static str, StatusCode> {
-    let payload: Message = from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let tx = state.topics.entry(topic).or_insert_with(|| {
-        let (tx, _rx) = broadcast::channel(1024 * 64);
-        tx
-    });
-    let _ = tx.send(payload);
-    Ok("OK")
-}
-
-async fn subscribe(
-    State(state): State<Arc<AppState>>,
-    Path(topic): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let tx = state.topics.entry(topic).or_insert_with(|| {
-        let (tx, _rx) = broadcast::channel(1024 * 64);
-        tx
-    });
-    let mut rx = tx.subscribe();
-
-    let stream = async_stream::stream! {
-        while let Ok(msg) = rx.recv().await {
-            yield Ok(Event::default().data(msg.payload));
-        }
-    };
-
-    Sse::new(stream)
+    Server::builder()
+        .add_service(HugiMqServiceServer::new(server))
+        .serve(addr)
+        .await
+        .unwrap();
 }

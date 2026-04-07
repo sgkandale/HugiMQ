@@ -3,22 +3,22 @@ use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::sync::{Barrier, Mutex};
 use tokio::time::{Duration, Instant};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
 use std::time::SystemTime;
-use rmp_serde::to_vec;
-use serde::Serialize;
 
-#[derive(Serialize)]
-struct Message {
-    payload: String,
+pub mod hugimq {
+    tonic::include_proto!("hugimq");
 }
+
+use hugimq::hugi_mq_service_client::HugiMqServiceClient;
+use hugimq::{PublishRequest, SubscribeRequest};
 
 #[derive(Parser, Debug)]
 #[command(
-    author, 
-    version, 
+    author,
+    version,
     about = "High-performance pub/sub benchmarker",
     after_help = "EXAMPLES:\n  Run HugiMQ benchmark:\n    cargo run --release -p benchmarker -- hugimq --connections 20 --messages-per-conn 50000\n\n  Run Redis benchmark:\n    cargo run --release -p benchmarker -- redis --connections 20 --messages-per-conn 50000\n\n  Test with 5KB payloads:\n    cargo run --release -p benchmarker -- hugimq --payload-size 5120"
 )]
@@ -38,7 +38,7 @@ struct Args {
     #[arg(long, default_value = "redis://127.0.0.1/")]
     redis_url: String,
 
-    #[arg(long, default_value = "http://127.0.0.1:6379")]
+    #[arg(long, default_value = "http://127.0.0.1:6380")]
     hugimq_url: String,
 
     #[arg(long, default_value_t = 1)]
@@ -55,20 +55,20 @@ enum Target {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    
+
     if args.connections < 2 {
         eprintln!("Error: Connections must be at least 2 (1 producer, 1 consumer)");
         std::process::exit(1);
     }
 
-    println!("Target: {:?} | Connections: {} | Topics: {} | Msg/Conn: {} | Payload: {} bytes", 
+    println!("Target: {:?} | Connections: {} | Topics: {} | Msg/Conn: {} | Payload: {} bytes",
              args.target, args.connections, args.topics, args.messages_per_conn, args.payload_size);
 
     let num_producers = args.connections / 2;
     let num_consumers = args.connections - num_producers;
-    
+
     let total_expected_messages = num_producers * args.messages_per_conn;
-    
+
     // Calculate total expected deliveries based on how topics are distributed.
     // Each producer publishes to ONE topic. Each consumer subscribes to ONE topic.
     // A message is delivered to all consumers on that topic.
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let total_received = Arc::new(AtomicU64::new(0));
-    
+
     let barrier = Arc::new(Barrier::new(args.connections));
     let start_barrier = Arc::new(Barrier::new(args.connections + 1));
 
@@ -89,7 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = Vec::new();
     let payload = Arc::new("a".repeat(args.payload_size));
-    let client = Arc::new(reqwest::Client::new());
 
     println!("Spawning {} consumers and {} producers...", num_consumers, num_producers);
 
@@ -101,14 +100,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let e2e_hist = Arc::clone(&e2e_hist);
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
-        let client = Arc::clone(&client);
+        let topic_idx = consumer_id % args.topics;
         let topic_name = if args.topics > 1 {
-            format!("benchmark_topic_{}", consumer_id % args.topics)
+            format!("benchmark_topic_{}", topic_idx)
         } else {
             "benchmark_topic".to_string()
         };
-        
+
+        // Each consumer expects messages from all producers on the SAME topic
+        let producers_on_topic = (0..num_producers).filter(|&p_id| p_id % args.topics == topic_idx).count();
+        let expected_for_this_consumer = (args.messages_per_conn * producers_on_topic) as u64;
+
         handles.push(tokio::spawn(async move {
+            let mut received_by_this_consumer = 0u64;
             let mut local_e2e = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
             match target {
                 Target::Redis => {
@@ -116,77 +120,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let con = client.get_async_connection().await.unwrap();
                     let mut pubsub = con.into_pubsub();
                     pubsub.subscribe(&topic_name).await.unwrap();
-                    
+
                     b.wait().await;
                     sb.wait().await;
-                    
+
                     let mut stream = pubsub.on_message();
-                    while let Some(msg) = stream.next().await {
-                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                        let payload_bytes: Vec<u8> = msg.get_payload().unwrap();
-                        let payload_str = String::from_utf8_lossy(&payload_bytes);
-                        
-                        let parts: Vec<&str> = payload_str.splitn(4, ':').collect();
-                        if parts.len() >= 3 {
-                            if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                let latency = (now.saturating_sub(sent_at)) as u64;
-                                let _ = local_e2e.record(latency);
+                    while received_by_this_consumer < expected_for_this_consumer {
+                        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                            Ok(Some(msg)) => {
+                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                let payload_bytes: Vec<u8> = msg.get_payload().unwrap();
+                                let payload_str = String::from_utf8_lossy(&payload_bytes);
+
+                                let parts: Vec<&str> = payload_str.splitn(4, ':').collect();
+                                if parts.len() >= 3 {
+                                    if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                        let latency = (now.saturating_sub(sent_at)) as u64;
+                                        let _ = local_e2e.record(latency);
+                                    }
+                                }
+
+                                total_received.fetch_add(1, Ordering::Relaxed);
+                                received_by_this_consumer += 1;
                             }
-                        }
-                        
-                        total_received.fetch_add(1, Ordering::Relaxed);
-                        if total_received.load(Ordering::Relaxed) >= total_expected_deliveries {
-                            break;
+                            Ok(None) => break,
+                            Err(_) => {
+                                eprintln!("Consumer {} timed out waiting for message (received {}/{})", consumer_id, received_by_this_consumer, expected_for_this_consumer);
+                                break;
+                            }
                         }
                     }
                 }
                 Target::Hugimq => {
-                    let mut response = client.get(format!("{}/subscribe/{}", hugimq_url, topic_name))
-                        .send()
-                        .await
-                        .unwrap()
-                        .bytes_stream();
-                    
+                    let mut client = HugiMqServiceClient::connect(hugimq_url.to_string()).await.unwrap();
                     b.wait().await;
                     sb.wait().await;
-                    
-                    let mut buffer = String::new();
-                    while let Some(chunk) = response.next().await {
-                        if let Ok(bytes) = chunk {
-                            let s = String::from_utf8_lossy(&bytes);
-                            buffer.push_str(&s);
-                            
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let message = buffer[..pos].to_string();
-                                buffer = buffer[pos + 2..].to_string();
-                                
-                                for line in message.lines() {
-                                    if line.starts_with("data: ") {
-                                        let data = &line[6..];
-                                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                        
-                                        let parts: Vec<&str> = data.splitn(5, ':').collect();
-                                        if parts.len() >= 4 {
-                                            let received_topic = parts[3];
-                                            if received_topic != topic_name {
-                                                eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
-                                                std::process::exit(1);
-                                            }
 
-                                            if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                                let latency = (now.saturating_sub(sent_at)) as u64;
-                                                let _ = local_e2e.record(latency);
-                                            }
-                                        }
-                                        
-                                        total_received.fetch_add(1, Ordering::Relaxed);
+                    let response = client.subscribe(SubscribeRequest { topic: topic_name.clone() }).await.unwrap();
+                    let mut stream = response.into_inner();
+
+                    while received_by_this_consumer < expected_for_this_consumer {
+                        match tokio::time::timeout(Duration::from_secs(5), stream.try_next()).await {
+                            Ok(Ok(Some(msg))) => {
+                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                let data = msg.payload;
+
+                                let parts: Vec<&str> = data.splitn(5, ':').collect();
+                                if parts.len() >= 4 {
+                                    let received_topic = parts[3];
+                                    if received_topic != topic_name {
+                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
+                                        std::process::exit(1);
+                                    }
+
+                                    if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                        let latency = (now.saturating_sub(sent_at)) as u64;
+                                        let _ = local_e2e.record(latency);
                                     }
                                 }
-                                if total_received.load(Ordering::Relaxed) >= total_expected_deliveries {
-                                    break;
-                                }
+
+                                total_received.fetch_add(1, Ordering::Relaxed);
+                                received_by_this_consumer += 1;
                             }
-                            if total_received.load(Ordering::Relaxed) >= total_expected_deliveries {
+                            Ok(Ok(None)) => break,
+                            Ok(Err(e)) => {
+                                eprintln!("Consumer {} stream error: {:?}", consumer_id, e);
+                                break;
+                            }
+                            Err(_) => {
+                                eprintln!("Consumer {} timed out waiting for message (received {}/{})", consumer_id, received_by_this_consumer, expected_for_this_consumer);
                                 break;
                             }
                         }
@@ -207,7 +209,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pub_ack_hist = Arc::clone(&pub_ack_hist);
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
-        let client = Arc::clone(&client);
         let topic_name = if args.topics > 1 {
             format!("benchmark_topic_{}", prod_id % args.topics)
         } else {
@@ -220,14 +221,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Target::Redis => {
                     let client = redis::Client::open(redis_url.as_str()).unwrap();
                     let mut con = client.get_async_connection().await.unwrap();
-                    
+
                     b.wait().await;
                     sb.wait().await;
-                    
+
                     for seq in 0..msg_count {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
-                        
+
                         let ack_start = Instant::now();
                         let _: () = con.publish(&topic_name, msg).await.unwrap();
                         let ack_latency = ack_start.elapsed().as_nanos() as u64;
@@ -235,22 +236,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Target::Hugimq => {
+                    let mut client = HugiMqServiceClient::connect(hugimq_url.to_string()).await.unwrap();
                     b.wait().await;
                     sb.wait().await;
-                    
+
                     for seq in 0..msg_count {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
                         let ack_start = Instant::now();
-                        let payload_bytes = to_vec(&Message { payload: msg }).unwrap();
-                        let resp = client.post(format!("{}/publish/{}", hugimq_url, topic_name))
-                            .body(payload_bytes)
-                            .send()
-                            .await;
-                        
+                        let resp = client.publish(PublishRequest {
+                            topic: topic_name.clone(),
+                            payload: msg,
+                        }).await;
+
                         if let Ok(resp) = resp {
-                            if resp.status().is_success() {
+                            if resp.get_ref().ok {
                                 let ack_latency = ack_start.elapsed().as_nanos() as u64;
                                 let _ = local_pub_ack.record(ack_latency);
                             }
@@ -267,18 +268,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     start_barrier.wait().await;
 
-    let mut last_count = 0;
-    while start_time.elapsed() < Duration::from_secs(60) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let current = total_received.load(Ordering::Relaxed);
-        let delta = current - last_count;
-        last_count = current;
-        println!("Current Throughput: {} msg/s | Total Received: {}/{}", delta, current, total_expected_deliveries);
-        
-        if current >= total_expected_deliveries {
-            break;
+    // Spawn a monitor task to print throughput
+    let total_received_monitor = Arc::clone(&total_received);
+    let monitor_handle = tokio::spawn(async move {
+        let mut last_count = 0;
+        let start_time = Instant::now();
+        while start_time.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let current = total_received_monitor.load(Ordering::Relaxed);
+            let delta = current - last_count;
+            last_count = current;
+            println!("Current Throughput: {} msg/s | Total Received: {}/{}", delta, current, total_expected_deliveries);
+
+            if current >= total_expected_deliveries {
+                break;
+            }
         }
+    });
+
+    // Wait for all producers and consumers to finish
+    for handle in handles {
+        let _ = handle.await;
     }
+    monitor_handle.abort();
 
     let duration = start_time.elapsed();
     let final_received = total_received.load(Ordering::Relaxed);

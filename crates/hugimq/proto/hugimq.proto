@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package hugimq;
+
+message PublishRequest {
+    string topic = 1;
+    string payload = 2;
+}
+
+message PublishResponse {
+    bool ok = 1;
+}
+
+message SubscribeRequest {
+    string topic = 1;
+}
+
+message SubscribeResponse {
+    string payload = 1;
+}
+
+service HugiMQService {
+    rpc Publish(PublishRequest) returns (PublishResponse);
+    rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
