@@ -3,7 +3,7 @@ pub mod hugimq {
 }
 
 use dashmap::DashMap;
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use hugimq::hugi_mq_service_server::{HugiMqService, HugiMqServiceServer};
 use hugimq::{PublishRequest, PublishResponse, SubscribeRequest, SubscribeResponse};
 use std::{pin::Pin, sync::Arc};
@@ -30,24 +30,34 @@ impl HugiMqService for HugiMQServer {
 
     async fn publish(
         &self,
-        request: Request<PublishRequest>,
+        request: Request<tonic::Streaming<PublishRequest>>,
     ) -> Result<Response<PublishResponse>, Status> {
-        let req = request.into_inner();
-        let topic = req.topic;
-        let payload = Message { payload: bytes::Bytes::from(req.payload) };
+        let mut stream = request.into_inner();
 
-        // Fast-path: check if topic already exists with a read-lock
-        let tx = if let Some(tx) = self.state.topics.get(&topic) {
-            tx.clone()
-        } else {
-            // Slow-path: create the topic with an entry lock
-            self.state.topics.entry(topic).or_insert_with(|| {
-                let (tx, _rx) = broadcast::channel(1024 * 256);
-                tx
-            }).clone()
-        };
+        while let Some(req) = stream.next().await {
+            let req = req?;
+            let topic = req.topic;
+            let payload = Message {
+                payload: bytes::Bytes::from(req.payload),
+            };
 
-        let _ = tx.send(payload);
+            // Fast-path: check if topic already exists with a read-lock
+            let tx = if let Some(tx) = self.state.topics.get(&topic) {
+                tx.clone()
+            } else {
+                // Slow-path: create the topic with an entry lock
+                self.state.topics
+                    .entry(topic)
+                    .or_insert_with(|| {
+                        let (tx, _rx) = broadcast::channel(1024 * 256);
+                        tx
+                    })
+                    .clone()
+            };
+
+            let _ = tx.send(payload);
+        }
+
         Ok(Response::new(PublishResponse { ok: true }))
     }
 

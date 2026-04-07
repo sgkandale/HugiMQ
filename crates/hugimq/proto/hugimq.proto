@@ -20,6 +20,6 @@ message SubscribeResponse {
 }
 
 service HugiMQService {
-    rpc Publish(PublishRequest) returns (PublishResponse);
+    rpc Publish(stream PublishRequest) returns (PublishResponse);
     rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 }

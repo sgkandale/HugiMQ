@@ -240,21 +240,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.wait().await;
                     sb.wait().await;
 
+                    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+                    let response_handle = tokio::spawn(async move {
+                        client.publish(stream).await
+                    });
+
                     for seq in 0..msg_count {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
                         let ack_start = Instant::now();
-                        let resp = client.publish(PublishRequest {
+                        if let Err(_) = tx.send(PublishRequest {
                             topic: topic_name.clone(),
                             payload: msg.into_bytes().into(),
-                        }).await;
+                        }).await {
+                            break;
+                        }
+                        let ack_latency = ack_start.elapsed().as_nanos() as u64;
+                        let _ = local_pub_ack.record(ack_latency);
+                    }
+                    drop(tx);
 
-                        if let Ok(resp) = resp {
-                            if resp.get_ref().ok {
-                                let ack_latency = ack_start.elapsed().as_nanos() as u64;
-                                let _ = local_pub_ack.record(ack_latency);
+                    match response_handle.await {
+                        Ok(Ok(resp)) => {
+                            if !resp.get_ref().ok {
+                                eprintln!("Producer {} failed: server returned not ok", prod_id);
                             }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("Producer {} streaming error: {:?}", prod_id, e);
+                        }
+                        Err(e) => {
+                            eprintln!("Producer {} handle error: {:?}", prod_id, e);
                         }
                     }
                 }
