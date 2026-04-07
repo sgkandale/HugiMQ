@@ -38,7 +38,7 @@ struct Args {
     #[arg(long, default_value = "redis://127.0.0.1/")]
     redis_url: String,
 
-    #[arg(long, default_value = "http://127.0.0.1:6379")]
+    #[arg(long, default_value = "http://127.0.0.1:6380")]
     hugimq_url: String,
 
     #[arg(long, default_value_t = 1)]

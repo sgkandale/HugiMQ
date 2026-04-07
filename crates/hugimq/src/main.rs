@@ -22,6 +22,13 @@ struct Message {
     payload: Arc<bytes::Bytes>,
 }
 
+/// Per-subscriber bounded channel capacity.
+///
+/// This creates natural backpressure: when a consumer's queue fills up,
+/// the producer awaits space instead of flooding memory with unbounded
+/// messages. This prevents bufferbloat and the resulting consumer timeouts.
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
+
 /// A single topic with per-subscriber mpsc channels.
 ///
 /// # Why not `broadcast`?
@@ -29,12 +36,14 @@ struct Message {
 /// tail, serializing ALL producers to the same topic through a single lock.
 /// At multi-million msg/s this becomes the dominant bottleneck.
 ///
-/// Here we use an `RwLock<Vec<mpsc::UnboundedSender>>` instead:
+/// Here we use an `RwLock<Vec<mpsc::Sender>>` instead:
 ///   - The read-lock allows unlimited concurrent producers (no serialization).
-///   - Each `mpsc::UnboundedSender::send()` operates on an independent channel,
-///     so fan-out to N subscribers is parallelizable across cores.
+///   - Each `mpsc::Sender::send()` operates on an independent bounded channel,
+///     providing per-subscriber backpressure without global contention.
 struct Topic {
-    subscribers: tokio::sync::RwLock<Vec<mpsc::UnboundedSender<Message>>>,
+    /// Subscribers list — read lock is held briefly to clone senders,
+    /// then released before any async sends occur.
+    subscribers: tokio::sync::RwLock<Vec<mpsc::Sender<Message>>>,
     /// Tracks how many subscribers exist (atomic snapshot for fast-path logging).
     subscriber_count: AtomicUsize,
 }
@@ -53,7 +62,7 @@ pub struct HugiMQServer {
 /// generates extra boilerplate for yield/resume transitions. A direct wrapper
 /// is a single `Poll` match per message.
 struct SubscribeStream {
-    rx: mpsc::UnboundedReceiver<Message>,
+    rx: mpsc::Receiver<Message>,
 }
 
 impl Stream for SubscribeStream {
@@ -105,27 +114,28 @@ impl HugiMqService for HugiMQServer {
                 payload: Arc::new(bytes::Bytes::from(req.payload)),
             };
 
-            // Read-lock: multiple producers can publish simultaneously without
-            // serializing on each other.
-            let subs = topic.subscribers.read().await;
-            let mut dead_indices = Vec::new();
+            // Phase 1: Clone senders under the read lock (fast), then release.
+            // We must release the lock before any .await calls to avoid deadlocking
+            // with concurrent subscriber registration/cleanup.
+            let subs: Vec<mpsc::Sender<Message>> = {
+                let subs = topic.subscribers.read().await;
+                subs.iter().cloned().collect()
+            };
 
+            // Phase 2: Send to each subscriber with backpressure.
+            // If a channel is full, we await space — this slows the producer
+            // to the consumer's pace instead of flooding memory or dropping messages.
+            let mut dead_senders = Vec::new();
             for (i, sub) in subs.iter().enumerate() {
-                if sub.send(msg.clone()).is_err() {
-                    // Receiver dropped — mark for cleanup
-                    dead_indices.push(i);
+                if sub.send(msg.clone()).await.is_err() {
+                    dead_senders.push(i);
                 }
             }
 
-            // Drop read-lock before attempting cleanup
-            drop(subs);
-
-            // If any dead subscribers were found, prune them under a write-lock.
-            // This amortizes cleanup into the publish path with no background threads.
-            if !dead_indices.is_empty() {
+            // Phase 3: Prune dead subscribers under write-lock if needed.
+            if !dead_senders.is_empty() {
                 let mut subs_mut = topic.subscribers.write().await;
-                // Remove in reverse order to preserve indices
-                for i in dead_indices.into_iter().rev() {
+                for i in dead_senders.into_iter().rev() {
                     subs_mut.swap_remove(i);
                 }
                 topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
@@ -143,7 +153,7 @@ impl HugiMqService for HugiMQServer {
         let topic_name = req.topic;
 
         let topic = self.get_or_create_topic(&topic_name);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
 
         // Register this subscriber
         {
