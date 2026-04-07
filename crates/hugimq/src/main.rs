@@ -3,25 +3,71 @@ pub mod hugimq {
 }
 
 use dashmap::DashMap;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
+use futures::StreamExt;
 use hugimq::hugi_mq_service_server::{HugiMqService, HugiMqServiceServer};
 use hugimq::{PublishRequest, PublishResponse, SubscribeRequest, SubscribeResponse};
-use std::{pin::Pin, sync::Arc};
-use tokio::sync::broadcast;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Shared message payload — reference-counted to avoid copying the underlying
+/// byte buffer when fanning out to multiple subscribers.
 #[derive(Debug, Clone)]
 struct Message {
-    payload: bytes::Bytes,
+    payload: Arc<bytes::Bytes>,
+}
+
+/// A single topic with per-subscriber mpsc channels.
+///
+/// # Why not `broadcast`?
+/// `tokio::sync::broadcast::send()` acquires a `Mutex` on the shared ring-buffer
+/// tail, serializing ALL producers to the same topic through a single lock.
+/// At multi-million msg/s this becomes the dominant bottleneck.
+///
+/// Here we use an `RwLock<Vec<mpsc::UnboundedSender>>` instead:
+///   - The read-lock allows unlimited concurrent producers (no serialization).
+///   - Each `mpsc::UnboundedSender::send()` operates on an independent channel,
+///     so fan-out to N subscribers is parallelizable across cores.
+struct Topic {
+    subscribers: tokio::sync::RwLock<Vec<mpsc::UnboundedSender<Message>>>,
+    /// Tracks how many subscribers exist (atomic snapshot for fast-path logging).
+    subscriber_count: AtomicUsize,
 }
 
 struct AppState {
-    topics: DashMap<String, broadcast::Sender<Message>>,
+    topics: DashMap<String, Arc<Topic>>,
 }
 
 pub struct HugiMQServer {
     state: Arc<AppState>,
+}
+
+/// Hand-written `Stream` implementation wrapping an `mpsc::UnboundedReceiver`.
+///
+/// This avoids the state-machine overhead of `async_stream::stream!` which
+/// generates extra boilerplate for yield/resume transitions. A direct wrapper
+/// is a single `Poll` match per message.
+struct SubscribeStream {
+    rx: mpsc::UnboundedReceiver<Message>,
+}
+
+impl Stream for SubscribeStream {
+    type Item = Result<SubscribeResponse, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.rx).poll_recv(cx) {
+            Poll::Ready(Some(msg)) => Poll::Ready(Some(Ok(SubscribeResponse {
+                payload: msg.payload.as_ref().clone().into(),
+            }))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -34,28 +80,56 @@ impl HugiMqService for HugiMQServer {
     ) -> Result<Response<PublishResponse>, Status> {
         let mut stream = request.into_inner();
 
+        // Per-stream cache for topics to avoid global map contention.
+        // 4-slot LRU-ish cache for hot topics.
+        let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
+
         while let Some(req) = stream.next().await {
             let req = req?;
-            let topic = req.topic;
-            let payload = Message {
-                payload: bytes::Bytes::from(req.payload),
-            };
+            let topic_name = req.topic;
 
-            // Fast-path: check if topic already exists with a read-lock
-            let tx = if let Some(tx) = self.state.topics.get(&topic) {
-                tx.clone()
+            // Check cache first
+            let topic = if let Some(found) = cache.iter().find(|(name, _)| name == &topic_name) {
+                found.1.clone()
             } else {
-                // Slow-path: create the topic with an entry lock
-                self.state.topics
-                    .entry(topic)
-                    .or_insert_with(|| {
-                        let (tx, _rx) = broadcast::channel(1024 * 256);
-                        tx
-                    })
-                    .clone()
+                let topic = self.get_or_create_topic(&topic_name);
+
+                if cache.len() >= 4 {
+                    cache.remove(0);
+                }
+                cache.push((topic_name.clone(), topic.clone()));
+                topic
             };
 
-            let _ = tx.send(payload);
+            let msg = Message {
+                payload: Arc::new(bytes::Bytes::from(req.payload)),
+            };
+
+            // Read-lock: multiple producers can publish simultaneously without
+            // serializing on each other.
+            let subs = topic.subscribers.read().await;
+            let mut dead_indices = Vec::new();
+
+            for (i, sub) in subs.iter().enumerate() {
+                if sub.send(msg.clone()).is_err() {
+                    // Receiver dropped — mark for cleanup
+                    dead_indices.push(i);
+                }
+            }
+
+            // Drop read-lock before attempting cleanup
+            drop(subs);
+
+            // If any dead subscribers were found, prune them under a write-lock.
+            // This amortizes cleanup into the publish path with no background threads.
+            if !dead_indices.is_empty() {
+                let mut subs_mut = topic.subscribers.write().await;
+                // Remove in reverse order to preserve indices
+                for i in dead_indices.into_iter().rev() {
+                    subs_mut.swap_remove(i);
+                }
+                topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
+            }
         }
 
         Ok(Response::new(PublishResponse { ok: true }))
@@ -66,37 +140,41 @@ impl HugiMqService for HugiMQServer {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let req = request.into_inner();
-        let topic = req.topic;
+        let topic_name = req.topic;
 
-        // Same optimization for subscribe
-        let tx = if let Some(tx) = self.state.topics.get(&topic) {
-            tx.clone()
-        } else {
-            self.state.topics.entry(topic).or_insert_with(|| {
-                let (tx, _rx) = broadcast::channel(1024 * 256);
-                tx
-            }).clone()
-        };
-        let mut rx = tx.subscribe();
+        let topic = self.get_or_create_topic(&topic_name);
+        let (tx, rx) = mpsc::unbounded_channel();
 
-        let stream = async_stream::stream! {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        yield Ok(SubscribeResponse { payload: msg.payload.into() });
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Consumer lagged by {} messages", n);
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-        };
+        // Register this subscriber
+        {
+            let mut subs = topic.subscribers.write().await;
+            subs.push(tx);
+            topic.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        }
 
+        let stream = SubscribeStream { rx };
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+impl HugiMQServer {
+    fn get_or_create_topic(&self, topic: &str) -> Arc<Topic> {
+        // Fast-path: read-only lookup (DashMap read-lock)
+        if let Some(entry) = self.state.topics.get(topic) {
+            return entry.clone();
+        }
+
+        // Slow-path: create if missing (DashMap entry lock)
+        self.state
+            .topics
+            .entry(topic.to_string())
+            .or_insert_with(|| {
+                Arc::new(Topic {
+                    subscribers: tokio::sync::RwLock::new(Vec::new()),
+                    subscriber_count: AtomicUsize::new(0),
+                })
+            })
+            .clone()
     }
 }
 

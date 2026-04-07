@@ -43,6 +43,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     topics: usize,
+
+    #[arg(long, default_value_t = 1)]
+    topics_per_producer: usize,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -61,22 +64,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    if args.topics < 1 {
+        eprintln!("Error: Topics must be at least 1");
+        std::process::exit(1);
+    }
+
+    if args.topics_per_producer < 1 || args.topics_per_producer > args.topics {
+        eprintln!("Error: topics_per_producer must be between 1 and topics ({}).", args.topics);
+        std::process::exit(1);
+    }
+
+    if args.messages_per_conn % args.topics_per_producer != 0 {
+        eprintln!(
+            "Warning: messages_per_conn ({}) is not evenly divisible by topics_per_producer ({}). Some messages will be dropped.",
+            args.messages_per_conn, args.topics_per_producer
+        );
+    }
+
     println!("Target: {:?} | Connections: {} | Topics: {} | Msg/Conn: {} | Payload: {} bytes",
              args.target, args.connections, args.topics, args.messages_per_conn, args.payload_size);
 
     let num_producers = args.connections / 2;
     let num_consumers = args.connections - num_producers;
 
-    let total_expected_messages = num_producers * args.messages_per_conn;
-
     // Calculate total expected deliveries based on how topics are distributed.
-    // Each producer publishes to ONE topic. Each consumer subscribes to ONE topic.
+    // Each producer publishes to topics_per_producer topics. Each consumer subscribes to ONE topic.
     // A message is delivered to all consumers on that topic.
     let mut total_expected_deliveries = 0u64;
     for p_id in 0..num_producers {
-        let topic_idx = p_id % args.topics;
-        let consumers_on_topic = (0..num_consumers).filter(|&c_id| c_id % args.topics == topic_idx).count();
-        total_expected_deliveries += (args.messages_per_conn * consumers_on_topic) as u64;
+        for i in 0..args.topics_per_producer {
+            let topic_idx = (p_id + i) % args.topics;
+            let consumers_on_topic = (0..num_consumers).filter(|&c_id| c_id % args.topics == topic_idx).count();
+            // We distribute the messages_per_conn across the chosen topics
+            let msgs_on_this_topic = args.messages_per_conn / args.topics_per_producer;
+            total_expected_deliveries += (msgs_on_this_topic * consumers_on_topic) as u64;
+        }
     }
 
     let total_received = Arc::new(AtomicU64::new(0));
@@ -101,15 +123,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
         let topic_idx = consumer_id % args.topics;
-        let topic_name = if args.topics > 1 {
-            format!("benchmark_topic_{}", topic_idx)
-        } else {
-            "benchmark_topic".to_string()
-        };
+        let topic_name = format!("benchmark_topic_{}", topic_idx);
 
-        // Each consumer expects messages from all producers on the SAME topic
-        let producers_on_topic = (0..num_producers).filter(|&p_id| p_id % args.topics == topic_idx).count();
-        let expected_for_this_consumer = (args.messages_per_conn * producers_on_topic) as u64;
+        // Each consumer expects messages from all producers on the SAME topic.
+        // Each producer splits its messages across topics_per_producer topics,
+        // so we divide messages_per_conn accordingly.
+        let producers_on_topic = (0..num_producers).filter(|&p_id| {
+            // A producer publishes to topic_idx if topic_idx is in its range [p_id, p_id + topics_per_producer)
+            (0..args.topics_per_producer).any(|i| (p_id + i) % args.topics == topic_idx)
+        }).count();
+        let expected_for_this_consumer = (args.messages_per_conn / args.topics_per_producer * producers_on_topic) as u64;
 
         handles.push(tokio::spawn(async move {
             let mut received_by_this_consumer = 0u64;
@@ -209,14 +232,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pub_ack_hist = Arc::clone(&pub_ack_hist);
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
-        let topic_name = if args.topics > 1 {
-            format!("benchmark_topic_{}", prod_id % args.topics)
-        } else {
-            "benchmark_topic".to_string()
-        };
+        let total_topics = args.topics;
+        let topics_per_prod = args.topics_per_producer;
 
         handles.push(tokio::spawn(async move {
             let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
+            
+            // Each producer has a set of topics it cycles through
+            let my_topics: Vec<String> = (0..topics_per_prod)
+                .map(|i| {
+                    let idx = (prod_id + i) % total_topics;
+                    format!("benchmark_topic_{}", idx)
+                })
+                .collect();
+
             match target {
                 Target::Redis => {
                     let client = redis::Client::open(redis_url.as_str()).unwrap();
@@ -226,11 +255,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sb.wait().await;
 
                     for seq in 0..msg_count {
+                        let topic_name = &my_topics[seq % my_topics.len()];
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
                         let ack_start = Instant::now();
-                        let _: () = con.publish(&topic_name, msg).await.unwrap();
+                        let _: () = con.publish(topic_name, msg).await.unwrap();
                         let ack_latency = ack_start.elapsed().as_nanos() as u64;
                         let _ = local_pub_ack.record(ack_latency);
                     }
@@ -243,39 +273,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (tx, rx) = tokio::sync::mpsc::channel(1024);
                     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
+                    let stream_start = Instant::now();
                     let response_handle = tokio::spawn(async move {
                         client.publish(stream).await
                     });
 
                     for seq in 0..msg_count {
+                        let topic_name = &my_topics[seq % my_topics.len()];
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
-                        let ack_start = Instant::now();
                         if let Err(_) = tx.send(PublishRequest {
                             topic: topic_name.clone(),
                             payload: msg.into_bytes().into(),
                         }).await {
                             break;
                         }
-                        let ack_latency = ack_start.elapsed().as_nanos() as u64;
-                        let _ = local_pub_ack.record(ack_latency);
                     }
                     drop(tx);
 
-                    match response_handle.await {
+                    let stream_duration = match response_handle.await {
                         Ok(Ok(resp)) => {
                             if !resp.get_ref().ok {
                                 eprintln!("Producer {} failed: server returned not ok", prod_id);
                             }
+                            stream_start.elapsed().as_nanos() as u64
                         }
                         Ok(Err(e)) => {
                             eprintln!("Producer {} streaming error: {:?}", prod_id, e);
+                            stream_start.elapsed().as_nanos() as u64
                         }
                         Err(e) => {
                             eprintln!("Producer {} handle error: {:?}", prod_id, e);
+                            stream_start.elapsed().as_nanos() as u64
                         }
-                    }
+                    };
+                    // Record the total stream duration as the producer ACK latency.
+                    // This measures the true round-trip time from first message sent
+                    // to server acknowledgment of the complete stream.
+                    let _ = local_pub_ack.record(stream_duration);
                 }
             }
             let mut global_pub_ack = pub_ack_hist.lock().await;
