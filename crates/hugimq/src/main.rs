@@ -91,7 +91,7 @@ async fn main() {
 
     let server = HugiMQServer { state };
 
-    let addr = "0.0.0.0:6380".parse().unwrap();
+    let addr = "0.0.0.0:6379".parse().unwrap();
     tracing::info!("listening on {}", addr);
 
     Server::builder()
