@@ -4,7 +4,7 @@ package hugimq;
 
 message PublishRequest {
     string topic = 1;
-    string payload = 2;
+    bytes payload = 2;
 }
 
 message PublishResponse {
@@ -16,7 +16,7 @@ message SubscribeRequest {
 }
 
 message SubscribeResponse {
-    string payload = 1;
+    bytes payload = 1;
 }
 
 service HugiMQService {

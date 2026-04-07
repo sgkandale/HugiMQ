@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone)]
 struct Message {
-    payload: String,
+    payload: bytes::Bytes,
 }
 
 struct AppState {
@@ -34,12 +34,19 @@ impl HugiMqService for HugiMQServer {
     ) -> Result<Response<PublishResponse>, Status> {
         let req = request.into_inner();
         let topic = req.topic;
-        let payload = Message { payload: req.payload };
+        let payload = Message { payload: bytes::Bytes::from(req.payload) };
 
-        let tx = self.state.topics.entry(topic).or_insert_with(|| {
-            let (tx, _rx) = broadcast::channel(1024 * 256);
-            tx
-        });
+        // Fast-path: check if topic already exists with a read-lock
+        let tx = if let Some(tx) = self.state.topics.get(&topic) {
+            tx.clone()
+        } else {
+            // Slow-path: create the topic with an entry lock
+            self.state.topics.entry(topic).or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(1024 * 256);
+                tx
+            }).clone()
+        };
+
         let _ = tx.send(payload);
         Ok(Response::new(PublishResponse { ok: true }))
     }
@@ -51,17 +58,22 @@ impl HugiMqService for HugiMQServer {
         let req = request.into_inner();
         let topic = req.topic;
 
-        let tx = self.state.topics.entry(topic).or_insert_with(|| {
-            let (tx, _rx) = broadcast::channel(1024 * 256);
-            tx
-        });
+        // Same optimization for subscribe
+        let tx = if let Some(tx) = self.state.topics.get(&topic) {
+            tx.clone()
+        } else {
+            self.state.topics.entry(topic).or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(1024 * 256);
+                tx
+            }).clone()
+        };
         let mut rx = tx.subscribe();
 
         let stream = async_stream::stream! {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        yield Ok(SubscribeResponse { payload: msg.payload });
+                        yield Ok(SubscribeResponse { payload: msg.payload.into() });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Consumer lagged by {} messages", n);

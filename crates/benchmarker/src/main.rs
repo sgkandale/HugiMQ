@@ -163,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match tokio::time::timeout(Duration::from_secs(5), stream.try_next()).await {
                             Ok(Ok(Some(msg))) => {
                                 let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                let data = msg.payload;
+                                let data = String::from_utf8_lossy(&msg.payload);
 
                                 let parts: Vec<&str> = data.splitn(5, ':').collect();
                                 if parts.len() >= 4 {
@@ -247,7 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let ack_start = Instant::now();
                         let resp = client.publish(PublishRequest {
                             topic: topic_name.clone(),
-                            payload: msg,
+                            payload: msg.into_bytes().into(),
                         }).await;
 
                         if let Ok(resp) = resp {
