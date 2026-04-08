@@ -26,7 +26,7 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity.
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 65536;
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
 /// A single topic with per-subscriber mpsc channels.
 struct Topic {
