@@ -26,7 +26,7 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity.
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 65536;
 
 /// A single topic with per-subscriber mpsc channels.
 struct Topic {
@@ -101,34 +101,36 @@ async fn handle_publish_socket(socket: WebSocket, state: Arc<AppState>) {
             payload: Arc::new(bytes::Bytes::from(payload_bytes)),
         };
 
-        // Clone subscribers for async delivery — do NOT await on send here.
-        // Spawning a delivery task prevents blocking the ACK response.
+        // Deliver to subscribers — use try_send first for speed, fall back to
+        // async send only if the channel is full. This avoids spawning millions
+        // of tasks while still providing backpressure.
         let subs: Vec<mpsc::Sender<Message>> = {
             let subs = topic.subscribers.read().await;
             subs.iter().cloned().collect()
         };
 
         if !subs.is_empty() {
-            let topic_for_cleanup = topic.clone();
-            tokio::spawn(async move {
-                let mut dead_indices = Vec::new();
-                for (i, sub) in subs.iter().enumerate() {
+            let mut dead_indices = Vec::new();
+            for (i, sub) in subs.iter().enumerate() {
+                // Try non-blocking send first
+                if sub.try_send(message.clone()).is_err() {
+                    // Channel full — must await
                     if sub.send(message.clone()).await.is_err() {
                         dead_indices.push(i);
                     }
                 }
+            }
 
-                if !dead_indices.is_empty() {
-                    let mut subs_mut = topic_for_cleanup.subscribers.write().await;
-                    for i in dead_indices.into_iter().rev() {
-                        subs_mut.swap_remove(i);
-                    }
-                    topic_for_cleanup.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
+            if !dead_indices.is_empty() {
+                let mut subs_mut = topic.subscribers.write().await;
+                for i in dead_indices.into_iter().rev() {
+                    subs_mut.swap_remove(i);
                 }
-            });
+                topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
+            }
         }
 
-        // Send ACK immediately — don't wait for delivery to complete
+        // ACK immediately
         let _ = tx.send(WsMessage::Binary(vec![0x01])).await;
     }
 }
