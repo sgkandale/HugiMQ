@@ -261,6 +261,7 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     handle_raw_tcp_connection(stream, state).await;
