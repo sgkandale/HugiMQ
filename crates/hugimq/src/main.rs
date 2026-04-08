@@ -5,7 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Decoder, Encoder, Framed};
@@ -22,7 +22,9 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity.
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 1_048_576;
+/// 4096 matches the gRPC Step 2.3 setting — small enough to apply backpressure
+/// immediately, large enough to absorb short burst jitter.
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
 
 struct Topic {
     subscribers: tokio::sync::RwLock<Vec<mpsc::Sender<Message>>>,
@@ -204,8 +206,20 @@ async fn process_publish_payload(
         subs.iter().cloned().collect()
     };
 
-    for sub in &subs {
-        let _ = sub.try_send(message.clone());
+    let mut dead_indices = Vec::new();
+    for (i, sub) in subs.iter().enumerate() {
+        if sub.send(message.clone()).await.is_err() {
+            dead_indices.push(i);
+        }
+    }
+
+    if !dead_indices.is_empty() {
+        let count = dead_indices.len();
+        let mut subs_lock = topic.subscribers.write().await;
+        for i in dead_indices.into_iter().rev() {
+            subs_lock.remove(i);
+        }
+        topic.subscriber_count.fetch_sub(count, Ordering::Relaxed);
     }
 }
 
