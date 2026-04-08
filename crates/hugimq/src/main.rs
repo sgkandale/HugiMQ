@@ -101,27 +101,34 @@ async fn handle_publish_socket(socket: WebSocket, state: Arc<AppState>) {
             payload: Arc::new(bytes::Bytes::from(payload_bytes)),
         };
 
+        // Clone subscribers for async delivery — do NOT await on send here.
+        // Spawning a delivery task prevents blocking the ACK response.
         let subs: Vec<mpsc::Sender<Message>> = {
             let subs = topic.subscribers.read().await;
             subs.iter().cloned().collect()
         };
 
-        let mut dead_indices = Vec::new();
-        for (i, sub) in subs.iter().enumerate() {
-            if sub.send(message.clone()).await.is_err() {
-                dead_indices.push(i);
-            }
+        if !subs.is_empty() {
+            let topic_for_cleanup = topic.clone();
+            tokio::spawn(async move {
+                let mut dead_indices = Vec::new();
+                for (i, sub) in subs.iter().enumerate() {
+                    if sub.send(message.clone()).await.is_err() {
+                        dead_indices.push(i);
+                    }
+                }
+
+                if !dead_indices.is_empty() {
+                    let mut subs_mut = topic_for_cleanup.subscribers.write().await;
+                    for i in dead_indices.into_iter().rev() {
+                        subs_mut.swap_remove(i);
+                    }
+                    topic_for_cleanup.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
+                }
+            });
         }
 
-        if !dead_indices.is_empty() {
-            let mut subs_mut = topic.subscribers.write().await;
-            for i in dead_indices.into_iter().rev() {
-                subs_mut.swap_remove(i);
-            }
-            topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
-        }
-
-        // ACK as binary: single byte 0x01
+        // Send ACK immediately — don't wait for delivery to complete
         let _ = tx.send(WsMessage::Binary(vec![0x01])).await;
     }
 }
