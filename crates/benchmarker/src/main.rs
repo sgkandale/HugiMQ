@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{Barrier, Mutex};
 use tokio::time::{Duration, Instant};
 use futures::{StreamExt, TryStreamExt};
+use futures_util::SinkExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
 use std::time::SystemTime;
@@ -23,7 +24,7 @@ use hugimq::{PublishRequest, SubscribeRequest};
     after_help = "EXAMPLES:\n  Run HugiMQ benchmark:\n    cargo run --release -p benchmarker -- hugimq --connections 20 --messages-per-conn 50000\n\n  Run Redis benchmark:\n    cargo run --release -p benchmarker -- redis --connections 20 --messages-per-conn 50000\n\n  Test with 5KB payloads:\n    cargo run --release -p benchmarker -- hugimq --payload-size 5120"
 )]
 struct Args {
-    #[arg(help = "The system to benchmark (redis or hugimq)")]
+    #[arg(help = "The system to benchmark (redis, hugimq, or hugimq-ws)")]
     target: Target,
 
     #[arg(short, long, default_value_t = 10)]
@@ -41,6 +42,9 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:6379")]
     hugimq_url: String,
 
+    #[arg(long, default_value = "ws://127.0.0.1:6379")]
+    hugimq_ws_url: String,
+
     #[arg(long, default_value_t = 1)]
     topics: usize,
 
@@ -53,6 +57,7 @@ struct Args {
 enum Target {
     Redis,
     Hugimq,
+    HugimqWs,
 }
 
 #[tokio::main]
@@ -122,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let e2e_hist = Arc::clone(&e2e_hist);
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
+        let hugimq_ws_url = args.hugimq_ws_url.clone();
         let topic_idx = consumer_id % args.topics;
         let topic_name = format!("benchmark_topic_{}", topic_idx);
 
@@ -220,6 +226,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                Target::HugimqWs => {
+                    let ws_url = format!("{}/ws/subscribe?topic={}", hugimq_ws_url, topic_name);
+                    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+                    let (_ws_tx, mut ws_rx) = ws_stream.split();
+
+                    // Subscribe BEFORE the barriers so we're ready when producers start.
+                    b.wait().await;
+                    sb.wait().await;
+
+                    while received_by_this_consumer < expected_for_this_consumer {
+                        match tokio::time::timeout(Duration::from_secs(5), ws_rx.next()).await {
+                            Ok(Some(Ok(msg))) => {
+                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                if let tokio_tungstenite::tungstenite::Message::Binary(data) = msg {
+                                    // Binary: [2 bytes topic_len][topic bytes][payload bytes]
+                                    if data.len() < 2 {
+                                        continue;
+                                    }
+                                    let topic_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                                    if data.len() < 2 + topic_len {
+                                        continue;
+                                    }
+                                    let received_topic = String::from_utf8_lossy(&data[2..2 + topic_len]);
+                                    if received_topic != topic_name {
+                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
+                                        std::process::exit(1);
+                                    }
+
+                                    let payload_bytes = &data[2 + topic_len..];
+                                    let payload_str = String::from_utf8_lossy(payload_bytes);
+                                    let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
+                                    if parts.len() >= 3 {
+                                        if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                            let latency = (now.saturating_sub(sent_at)) as u64;
+                                            let _ = local_e2e.record(latency);
+                                        }
+                                    }
+
+                                    total_received.fetch_add(1, Ordering::Relaxed);
+                                    received_by_this_consumer += 1;
+                                }
+                            }
+                            Ok(Some(Err(e))) => {
+                                eprintln!("Consumer {} WebSocket error: {:?}", consumer_id, e);
+                                break;
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                eprintln!("Consumer {} timed out waiting for message (received {}/{})", consumer_id, received_by_this_consumer, expected_for_this_consumer);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             let mut global_e2e = e2e_hist.lock().await;
             global_e2e.add(local_e2e).unwrap();
@@ -235,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pub_ack_hist = Arc::clone(&pub_ack_hist);
         let redis_url = args.redis_url.clone();
         let hugimq_url = args.hugimq_url.clone();
+        let hugimq_ws_url = args.hugimq_ws_url.clone();
         let total_topics = args.topics;
         let topics_per_prod = args.topics_per_producer;
 
@@ -315,6 +376,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // This measures the true round-trip time from first message sent
                     // to server acknowledgment of the complete stream.
                     let _ = local_pub_ack.record(stream_duration);
+                }
+                Target::HugimqWs => {
+                    let ws_url = format!("{}/ws/publish", hugimq_ws_url);
+                    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+                    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+                    b.wait().await;
+                    sb.wait().await;
+
+                    let publish_start = Instant::now();
+
+                    for seq in 0..msg_count {
+                        let topic_name = &my_topics[seq % my_topics.len()];
+                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                        let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
+
+                        // Binary format: [2 bytes topic_len][topic bytes][payload bytes]
+                        let topic_bytes = topic_name.as_bytes();
+                        let topic_len = topic_bytes.len() as u16;
+                        let payload_bytes = msg.as_bytes();
+                        let mut frame = Vec::with_capacity(2 + topic_bytes.len() + payload_bytes.len());
+                        frame.extend_from_slice(&topic_len.to_be_bytes());
+                        frame.extend_from_slice(topic_bytes);
+                        frame.extend_from_slice(payload_bytes);
+
+                        if let Err(_) = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await {
+                            break;
+                        }
+                    }
+
+                    // Drain all server ACKs
+                    loop {
+                        match tokio::time::timeout(Duration::from_secs(5), ws_rx.next()).await {
+                            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))) => continue,
+                            Ok(Some(Ok(_))) => continue, // Skip any unexpected message types
+                            _ => break,
+                        }
+                    }
+
+                    let total_duration = publish_start.elapsed().as_nanos() as u64;
+                    let _ = local_pub_ack.record(total_duration);
                 }
             }
             let mut global_pub_ack = pub_ack_hist.lock().await;

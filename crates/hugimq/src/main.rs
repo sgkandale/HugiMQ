@@ -2,17 +2,20 @@ pub mod hugimq {
     tonic::include_proto!("hugimq");
 }
 
+use axum::{
+    extract::{Query, WebSocketUpgrade},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use axum::extract::ws::{Message as WsMessage, WebSocket};
 use dashmap::DashMap;
-use futures::stream::Stream;
 use futures::StreamExt;
-use hugimq::hugi_mq_service_server::{HugiMqService, HugiMqServiceServer};
-use hugimq::{PublishRequest, PublishResponse, SubscribeRequest, SubscribeResponse};
-use std::pin::Pin;
+use futures_util::SinkExt;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use tokio::sync::mpsc;
-use tonic::{transport::Server, Request, Response, Status};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Shared message payload — reference-counted to avoid copying the underlying
@@ -23,28 +26,11 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity.
-///
-/// This creates natural backpressure: when a consumer's queue fills up,
-/// the producer awaits space instead of flooding memory with unbounded
-/// messages. This prevents bufferbloat and the resulting consumer timeouts.
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
 
 /// A single topic with per-subscriber mpsc channels.
-///
-/// # Why not `broadcast`?
-/// `tokio::sync::broadcast::send()` acquires a `Mutex` on the shared ring-buffer
-/// tail, serializing ALL producers to the same topic through a single lock.
-/// At multi-million msg/s this becomes the dominant bottleneck.
-///
-/// Here we use an `RwLock<Vec<mpsc::Sender>>` instead:
-///   - The read-lock allows unlimited concurrent producers (no serialization).
-///   - Each `mpsc::Sender::send()` operates on an independent bounded channel,
-///     providing per-subscriber backpressure without global contention.
 struct Topic {
-    /// Subscribers list — read lock is held briefly to clone senders,
-    /// then released before any async sends occur.
     subscribers: tokio::sync::RwLock<Vec<mpsc::Sender<Message>>>,
-    /// Tracks how many subscribers exist (atomic snapshot for fast-path logging).
     subscriber_count: AtomicUsize,
 }
 
@@ -52,140 +38,156 @@ struct AppState {
     topics: DashMap<String, Arc<Topic>>,
 }
 
-pub struct HugiMQServer {
-    state: Arc<AppState>,
+#[derive(serde::Deserialize)]
+struct PublishRequest {
+    topic: String,
+    payload: String,
 }
 
-/// Hand-written `Stream` implementation wrapping an `mpsc::UnboundedReceiver`.
-///
-/// This avoids the state-machine overhead of `async_stream::stream!` which
-/// generates extra boilerplate for yield/resume transitions. A direct wrapper
-/// is a single `Poll` match per message.
-struct SubscribeStream {
-    rx: mpsc::Receiver<Message>,
+#[derive(serde::Deserialize)]
+struct SubscribeQuery {
+    topic: String,
 }
 
-impl Stream for SubscribeStream {
-    type Item = Result<SubscribeResponse, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.rx).poll_recv(cx) {
-            Poll::Ready(Some(msg)) => Poll::Ready(Some(Ok(SubscribeResponse {
-                payload: msg.payload.as_ref().clone().into(),
-            }))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+async fn ws_publish_handler(
+    ws: WebSocketUpgrade,
+    state: axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let state = state.0;
+    ws.on_upgrade(move |socket| handle_publish_socket(socket, state))
 }
 
-#[tonic::async_trait]
-impl HugiMqService for HugiMQServer {
-    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<SubscribeResponse, Status>> + Send>>;
+async fn handle_publish_socket(socket: WebSocket, state: Arc<AppState>) {
+    let (mut tx, mut rx) = socket.split();
+    let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
 
-    async fn publish(
-        &self,
-        request: Request<tonic::Streaming<PublishRequest>>,
-    ) -> Result<Response<PublishResponse>, Status> {
-        let mut stream = request.into_inner();
-
-        // Per-stream cache for topics to avoid global map contention.
-        // 4-slot LRU-ish cache for hot topics.
-        let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
-
-        while let Some(req) = stream.next().await {
-            let req = req?;
-            let topic_name = req.topic;
-
-            // Check cache first
-            let topic = if let Some(found) = cache.iter().find(|(name, _)| name == &topic_name) {
-                found.1.clone()
-            } else {
-                let topic = self.get_or_create_topic(&topic_name);
-
-                if cache.len() >= 4 {
-                    cache.remove(0);
+    while let Some(Ok(msg)) = rx.next().await {
+        // Binary format: [2 bytes topic_len][topic bytes][payload bytes]
+        let (topic_name, payload_bytes) = match &msg {
+            WsMessage::Binary(data) => {
+                if data.len() < 2 {
+                    continue;
                 }
-                cache.push((topic_name.clone(), topic.clone()));
-                topic
-            };
-
-            let msg = Message {
-                payload: Arc::new(bytes::Bytes::from(req.payload)),
-            };
-
-            // Phase 1: Clone senders under the read lock (fast), then release.
-            // We must release the lock before any .await calls to avoid deadlocking
-            // with concurrent subscriber registration/cleanup.
-            let subs: Vec<mpsc::Sender<Message>> = {
-                let subs = topic.subscribers.read().await;
-                subs.iter().cloned().collect()
-            };
-
-            // Phase 2: Send to each subscriber with backpressure.
-            // If a channel is full, we await space — this slows the producer
-            // to the consumer's pace instead of flooding memory or dropping messages.
-            let mut dead_senders = Vec::new();
-            for (i, sub) in subs.iter().enumerate() {
-                if sub.send(msg.clone()).await.is_err() {
-                    dead_senders.push(i);
+                let topic_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if data.len() < 2 + topic_len {
+                    continue;
                 }
+                let topic = String::from_utf8_lossy(&data[2..2 + topic_len]).into_owned();
+                let payload = data[2 + topic_len..].to_vec();
+                (topic, payload)
             }
+            WsMessage::Text(text) => {
+                let req: PublishRequest = match serde_json::from_str(text) {
+                    Ok(req) => req,
+                    Err(_) => continue,
+                };
+                (req.topic, req.payload.into_bytes())
+            }
+            _ => continue,
+        };
 
-            // Phase 3: Prune dead subscribers under write-lock if needed.
-            if !dead_senders.is_empty() {
-                let mut subs_mut = topic.subscribers.write().await;
-                for i in dead_senders.into_iter().rev() {
-                    subs_mut.swap_remove(i);
-                }
-                topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
+        let topic = if let Some(found) = cache.iter().find(|(name, _)| name == &topic_name) {
+            found.1.clone()
+        } else {
+            let topic = get_or_create_topic(&state, &topic_name);
+            if cache.len() >= 4 {
+                cache.remove(0);
+            }
+            cache.push((topic_name.clone(), topic.clone()));
+            topic
+        };
+
+        let message = Message {
+            payload: Arc::new(bytes::Bytes::from(payload_bytes)),
+        };
+
+        let subs: Vec<mpsc::Sender<Message>> = {
+            let subs = topic.subscribers.read().await;
+            subs.iter().cloned().collect()
+        };
+
+        let mut dead_indices = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            if sub.send(message.clone()).await.is_err() {
+                dead_indices.push(i);
             }
         }
 
-        Ok(Response::new(PublishResponse { ok: true }))
-    }
-
-    async fn subscribe(
-        &self,
-        request: Request<SubscribeRequest>,
-    ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let req = request.into_inner();
-        let topic_name = req.topic;
-
-        let topic = self.get_or_create_topic(&topic_name);
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
-
-        // Register this subscriber
-        {
-            let mut subs = topic.subscribers.write().await;
-            subs.push(tx);
-            topic.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        if !dead_indices.is_empty() {
+            let mut subs_mut = topic.subscribers.write().await;
+            for i in dead_indices.into_iter().rev() {
+                subs_mut.swap_remove(i);
+            }
+            topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
         }
 
-        let stream = SubscribeStream { rx };
-        Ok(Response::new(Box::pin(stream)))
+        // ACK as binary: single byte 0x01
+        let _ = tx.send(WsMessage::Binary(vec![0x01])).await;
     }
 }
 
-impl HugiMQServer {
-    fn get_or_create_topic(&self, topic: &str) -> Arc<Topic> {
-        // Fast-path: read-only lookup (DashMap read-lock)
-        if let Some(entry) = self.state.topics.get(topic) {
-            return entry.clone();
-        }
+async fn ws_subscribe_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<SubscribeQuery>,
+    state: axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let state = state.0;
+    ws.on_upgrade(move |socket| handle_subscribe_socket(socket, query.topic, state))
+}
 
-        // Slow-path: create if missing (DashMap entry lock)
-        self.state
-            .topics
-            .entry(topic.to_string())
-            .or_insert_with(|| {
-                Arc::new(Topic {
-                    subscribers: tokio::sync::RwLock::new(Vec::new()),
-                    subscriber_count: AtomicUsize::new(0),
-                })
+async fn handle_subscribe_socket(socket: WebSocket, topic_name: String, state: Arc<AppState>) {
+    let topic = get_or_create_topic(&state, &topic_name);
+    let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+    {
+        let mut subs = topic.subscribers.write().await;
+        subs.push(tx);
+        topic.subscriber_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut rx = rx;
+
+    let read_task = async {
+        while let Some(Ok(_)) = ws_rx.next().await {}
+    };
+
+    let write_task = async {
+        while let Some(msg) = rx.recv().await {
+            // Binary: [2 bytes topic_len][topic bytes][payload bytes]
+            let topic_bytes = topic_name.as_bytes();
+            let topic_len = topic_bytes.len() as u16;
+            let mut frame = Vec::with_capacity(2 + topic_bytes.len() + msg.payload.len());
+            frame.extend_from_slice(&topic_len.to_be_bytes());
+            frame.extend_from_slice(topic_bytes);
+            frame.extend_from_slice(&msg.payload);
+            if ws_tx.send(WsMessage::Binary(frame)).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = read_task => {}
+        _ = write_task => {}
+    }
+}
+
+fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
+    if let Some(entry) = state.topics.get(topic) {
+        return entry.clone();
+    }
+
+    state
+        .topics
+        .entry(topic.to_string())
+        .or_insert_with(|| {
+            Arc::new(Topic {
+                subscribers: tokio::sync::RwLock::new(Vec::new()),
+                subscriber_count: AtomicUsize::new(0),
             })
-            .clone()
-    }
+        })
+        .clone()
 }
 
 #[tokio::main]
@@ -199,14 +201,14 @@ async fn main() {
         topics: DashMap::new(),
     });
 
-    let server = HugiMQServer { state };
+    let ws_addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();
+    tracing::info!("WebSocket server listening on {}", ws_addr);
 
-    let addr = "0.0.0.0:6379".parse().unwrap();
-    tracing::info!("listening on {}", addr);
+    let app = Router::new()
+        .route("/ws/publish", get(ws_publish_handler))
+        .route("/ws/subscribe", get(ws_subscribe_handler))
+        .with_state(state);
 
-    Server::builder()
-        .add_service(HugiMqServiceServer::new(server))
-        .serve(addr)
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(ws_addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
