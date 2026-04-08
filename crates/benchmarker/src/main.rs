@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let topics_per_prod = args.topics_per_producer;
 
         handles.push(tokio::spawn(async move {
-            let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
+            let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 300_000_000_000, 3).unwrap();
             
             // Each producer has a set of topics it cycles through
             let my_topics: Vec<String> = (0..topics_per_prod)
