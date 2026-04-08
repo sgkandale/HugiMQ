@@ -1,3 +1,4 @@
+use bytes::{Buf, BytesMut};
 use clap::{Parser, ValueEnum};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6,6 +7,11 @@ use tokio::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
 use std::time::SystemTime;
+
+/// Read buffer size — 64KB per syscall
+const READ_BUF_SIZE: usize = 64 * 1024;
+/// Write batch size — 64KB per syscall
+const WRITE_BATCH_SIZE: usize = 64 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -152,51 +158,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.wait().await;
                     sb.wait().await;
 
-                    // Read loop: [2 bytes total_len][1 byte type][payload]
-                    let mut len_buf = [0u8; 2];
+                    // Read loop: buffered read — parse multiple frames from one 64KB read syscall
+                    // instead of two read_exact() calls per message.
+                    let mut read_buf = BytesMut::with_capacity(READ_BUF_SIZE);
+                    let mut read_bytes = [0u8; READ_BUF_SIZE];
+
                     while received_by_this_consumer < expected_for_this_consumer {
-                        match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut len_buf)).await {
-                            Ok(Ok(2)) => {
-                                let total_len = u16::from_be_bytes(len_buf) as usize;
-                                let mut msg_buf = vec![0u8; total_len];
-                                match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut msg_buf)).await {
-                                    Ok(Ok(_)) => {
-                                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                        let msg_type = msg_buf[0];
-                                        if msg_type == 0x03 { // MSG_SUBSCRIBE_DATA
-                                            let payload_data = &msg_buf[1..];
-                                            if payload_data.len() < 4 {
-                                                continue;
-                                            }
-                                            // Format: topic_len(2) + topic + payload_len(2) + payload_data
-                                            let t_len = u16::from_be_bytes([payload_data[0], payload_data[1]]) as usize;
-                                            if payload_data.len() < 2 + t_len + 2 {
-                                                continue;
-                                            }
-                                            let received_topic = String::from_utf8_lossy(&payload_data[2..2 + t_len]);
-                                            if received_topic != topic_name {
-                                                eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
-                                                std::process::exit(1);
-                                            }
-                                            let p_offset = 2 + t_len + 2;
-                                            let payload_bytes = &payload_data[p_offset..];
-                                            let payload_str = String::from_utf8_lossy(payload_bytes);
-                                            let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
-                                            if parts.len() >= 3 {
-                                                if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                                    let latency = (now.saturating_sub(sent_at)) as u64;
-                                                    let _ = local_e2e.record(latency);
-                                                }
-                                            }
-                                            total_received.fetch_add(1, Ordering::Relaxed);
-                                            received_by_this_consumer += 1;
+                        // Ensure we have at least 3 bytes (header)
+                        while read_buf.len() < 3 {
+                            let n = match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                reader.read(&mut read_bytes),
+                            ).await {
+                                Ok(Ok(n)) if n > 0 => n,
+                                _ => break,
+                            };
+                            read_buf.extend_from_slice(&read_bytes[..n]);
+                        }
+
+                        if read_buf.len() < 3 {
+                            break; // timeout or EOF
+                        }
+
+                        let total_len = u16::from_be_bytes([read_buf[0], read_buf[1]]) as usize;
+                        let frame_len = 2 + total_len;
+
+                        // If we don't have the full frame, read more
+                        while read_buf.len() < frame_len {
+                            let remaining = frame_len - read_buf.len();
+                            let to_read = remaining.min(read_bytes.len());
+                            let n = match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                reader.read(&mut read_bytes[..to_read]),
+                            ).await {
+                                Ok(Ok(n)) if n > 0 => n,
+                                _ => break,
+                            };
+                            read_buf.extend_from_slice(&read_bytes[..n]);
+                        }
+
+                        if read_buf.len() < frame_len {
+                            break; // timeout
+                        }
+
+                        let msg_type = read_buf[2];
+                        if msg_type == 0x03 { // MSG_SUBSCRIBE_DATA
+                            let payload_data = &read_buf[3..frame_len];
+                            if payload_data.len() >= 4 {
+                                let t_len = u16::from_be_bytes([payload_data[0], payload_data[1]]) as usize;
+                                if payload_data.len() >= 2 + t_len + 2 {
+                                    let received_topic = String::from_utf8_lossy(&payload_data[2..2 + t_len]);
+                                    if received_topic != topic_name {
+                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
+                                        std::process::exit(1);
+                                    }
+                                    let p_offset = 2 + t_len + 2;
+                                    let payload_bytes = &payload_data[p_offset..];
+                                    let payload_str = String::from_utf8_lossy(payload_bytes);
+                                    let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
+                                    if parts.len() >= 3 {
+                                        if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                            let latency = (now.saturating_sub(sent_at)) as u64;
+                                            let _ = local_e2e.record(latency);
                                         }
                                     }
-                                    _ => break,
+                                    total_received.fetch_add(1, Ordering::Relaxed);
+                                    received_by_this_consumer += 1;
                                 }
                             }
-                            _ => break,
                         }
+
+                        read_buf.advance(frame_len);
                     }
                 }
             }
@@ -239,28 +272,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sb.wait().await;
 
                     let publish_start = Instant::now();
+                    let mut write_buf = Vec::with_capacity(WRITE_BATCH_SIZE);
 
                     for seq in 0..msg_count {
                         let topic_name = &my_topics[seq % my_topics.len()];
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
-                        // Binary format: [2 bytes total_len][1 byte type][2 bytes topic_len][topic][payload]
                         let topic_bytes = topic_name.as_bytes();
                         let topic_len = topic_bytes.len() as u16;
                         let payload_bytes = msg.as_bytes();
                         let total_len = 1 + 2 + topic_bytes.len() + payload_bytes.len();
-                        let mut frame = Vec::with_capacity(2 + total_len);
-                        frame.extend_from_slice(&(total_len as u16).to_be_bytes());
-                        frame.push(0x02); // MSG_PUBLISH
-                        frame.extend_from_slice(&topic_len.to_be_bytes());
-                        frame.extend_from_slice(topic_bytes);
-                        frame.extend_from_slice(payload_bytes);
 
-                        if writer.write_all(&frame).await.is_err() {
-                            break;
+                        write_buf.extend_from_slice(&(total_len as u16).to_be_bytes());
+                        write_buf.push(0x02); // MSG_PUBLISH
+                        write_buf.extend_from_slice(&topic_len.to_be_bytes());
+                        write_buf.extend_from_slice(topic_bytes);
+                        write_buf.extend_from_slice(payload_bytes);
+
+                        // Flush when batch exceeds 64KB
+                        if write_buf.len() >= WRITE_BATCH_SIZE {
+                            if writer.write_all(&write_buf).await.is_err() {
+                                break;
+                            }
+                            write_buf.clear();
                         }
                     }
+                    // Flush remaining
+                    if !write_buf.is_empty() {
+                        let _ = writer.write_all(&write_buf).await;
+                    }
+                    let _ = writer.flush().await;
 
                     // Drain all server ACKs
                     let mut len_buf = [0u8; 2];
