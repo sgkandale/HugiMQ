@@ -1,30 +1,21 @@
 use clap::{Parser, ValueEnum};
-use redis::AsyncCommands;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Barrier, Mutex};
 use tokio::time::{Duration, Instant};
-use futures::{StreamExt, TryStreamExt};
-use futures_util::SinkExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
 use std::time::SystemTime;
-
-pub mod hugimq {
-    tonic::include_proto!("hugimq");
-}
-
-use hugimq::hugi_mq_service_client::HugiMqServiceClient;
-use hugimq::{PublishRequest, SubscribeRequest};
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
     about = "High-performance pub/sub benchmarker",
-    after_help = "EXAMPLES:\n  Run HugiMQ benchmark:\n    cargo run --release -p benchmarker -- hugimq --connections 20 --messages-per-conn 50000\n\n  Run Redis benchmark:\n    cargo run --release -p benchmarker -- redis --connections 20 --messages-per-conn 50000\n\n  Test with 5KB payloads:\n    cargo run --release -p benchmarker -- hugimq --payload-size 5120"
+    after_help = "EXAMPLES:\n  Run TCP benchmark:\n    cargo run --release -p benchmarker -- tcp --connections 20 --messages-per-conn 50000\n\n  Test with 5KB payloads:\n    cargo run --release -p benchmarker -- tcp --payload-size 5120"
 )]
 struct Args {
-    #[arg(help = "The system to benchmark (redis, hugimq, or hugimq-ws)")]
+    #[arg(help = "The system to benchmark")]
     target: Target,
 
     #[arg(short, long, default_value_t = 10)]
@@ -36,14 +27,8 @@ struct Args {
     #[arg(short, long, default_value_t = 128)]
     payload_size: usize,
 
-    #[arg(long, default_value = "redis://127.0.0.1/")]
-    redis_url: String,
-
-    #[arg(long, default_value = "http://127.0.0.1:6379")]
-    hugimq_url: String,
-
-    #[arg(long, default_value = "ws://127.0.0.1:6379")]
-    hugimq_ws_url: String,
+    #[arg(long, default_value = "tcp://127.0.0.1:6379")]
+    url: String,
 
     #[arg(long, default_value_t = 1)]
     topics: usize,
@@ -55,9 +40,7 @@ struct Args {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 #[value(rename_all = "lowercase")]
 enum Target {
-    Redis,
-    Hugimq,
-    HugimqWs,
+    Tcp,
 }
 
 #[tokio::main]
@@ -119,15 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Spawning {} consumers and {} producers...", num_consumers, num_producers);
 
+    // ─── Consumers ──────────────────────────────────────────────
     for consumer_id in 0..num_consumers {
         let total_received = Arc::clone(&total_received);
         let b = Arc::clone(&barrier);
         let sb = Arc::clone(&start_barrier);
         let target = args.target;
         let e2e_hist = Arc::clone(&e2e_hist);
-        let redis_url = args.redis_url.clone();
-        let hugimq_url = args.hugimq_url.clone();
-        let hugimq_ws_url = args.hugimq_ws_url.clone();
+        let url = args.url.clone();
         let topic_idx = consumer_id % args.topics;
         let topic_name = format!("benchmark_topic_{}", topic_idx);
 
@@ -143,140 +125,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handles.push(tokio::spawn(async move {
             let mut received_by_this_consumer = 0u64;
             let mut local_e2e = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
+
             match target {
-                Target::Redis => {
-                    let client = redis::Client::open(redis_url.as_str()).unwrap();
-                    let con = client.get_async_connection().await.unwrap();
-                    let mut pubsub = con.into_pubsub();
-                    pubsub.subscribe(&topic_name).await.unwrap();
+                Target::Tcp => {
+                    let stream = tokio::net::TcpStream::connect(url.replace("tcp://", ""))
+                        .await
+                        .unwrap();
+                    let (mut reader, mut writer) = tokio::io::split(stream);
 
-                    b.wait().await;
-                    sb.wait().await;
-
-                    let mut stream = pubsub.on_message();
-                    while received_by_this_consumer < expected_for_this_consumer {
-                        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-                            Ok(Some(msg)) => {
-                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                let payload_bytes: Vec<u8> = msg.get_payload().unwrap();
-                                let payload_str = String::from_utf8_lossy(&payload_bytes);
-
-                                let parts: Vec<&str> = payload_str.splitn(4, ':').collect();
-                                if parts.len() >= 3 {
-                                    if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                        let latency = (now.saturating_sub(sent_at)) as u64;
-                                        let _ = local_e2e.record(latency);
-                                    }
-                                }
-
-                                total_received.fetch_add(1, Ordering::Relaxed);
-                                received_by_this_consumer += 1;
-                            }
-                            Ok(None) => break,
-                            Err(_) => {
-                                eprintln!("Consumer {} timed out waiting for message (received {}/{})", consumer_id, received_by_this_consumer, expected_for_this_consumer);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Target::Hugimq => {
-                    let mut client = HugiMqServiceClient::connect(hugimq_url.to_string()).await.unwrap();
-
-                    // Subscribe BEFORE the barriers so we're ready when producers start.
-                    // This mirrors the Redis consumer which also subscribes before the barriers.
-                    let response = client.subscribe(SubscribeRequest { topic: topic_name.clone() }).await.unwrap();
-                    let mut stream = response.into_inner();
-
-                    b.wait().await;
-                    sb.wait().await;
-
-                    while received_by_this_consumer < expected_for_this_consumer {
-                        match tokio::time::timeout(Duration::from_secs(5), stream.try_next()).await {
-                            Ok(Ok(Some(msg))) => {
-                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                let data = String::from_utf8_lossy(&msg.payload);
-
-                                let parts: Vec<&str> = data.splitn(5, ':').collect();
-                                if parts.len() >= 4 {
-                                    let received_topic = parts[3];
-                                    if received_topic != topic_name {
-                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
-                                        std::process::exit(1);
-                                    }
-
-                                    if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                        let latency = (now.saturating_sub(sent_at)) as u64;
-                                        let _ = local_e2e.record(latency);
-                                    }
-                                }
-
-                                total_received.fetch_add(1, Ordering::Relaxed);
-                                received_by_this_consumer += 1;
-                            }
-                            Ok(Ok(None)) => break,
-                            Ok(Err(e)) => {
-                                eprintln!("Consumer {} stream error: {:?}", consumer_id, e);
-                                break;
-                            }
-                            Err(_) => {
-                                eprintln!("Consumer {} timed out waiting for message (received {}/{})", consumer_id, received_by_this_consumer, expected_for_this_consumer);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Target::HugimqWs => {
-                    let ws_url = format!("{}/ws/subscribe?topic={}", hugimq_ws_url, topic_name);
-                    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-                    let (_ws_tx, mut ws_rx) = ws_stream.split();
+                    // Send subscribe message: [2 bytes total_len][1 byte type][2 bytes topic_len][topic]
+                    let topic_bytes = topic_name.as_bytes();
+                    let topic_len = topic_bytes.len() as u16;
+                    let total_len = 1 + 2 + topic_bytes.len();
+                    let mut frame = Vec::with_capacity(2 + total_len);
+                    frame.extend_from_slice(&(total_len as u16).to_be_bytes());
+                    frame.push(0x01); // MSG_SUBSCRIBE
+                    frame.extend_from_slice(&topic_len.to_be_bytes());
+                    frame.extend_from_slice(topic_bytes);
+                    writer.write_all(&frame).await.unwrap();
 
                     // Subscribe BEFORE the barriers so we're ready when producers start.
                     b.wait().await;
                     sb.wait().await;
 
+                    // Read loop: [2 bytes total_len][1 byte type][payload]
+                    let mut len_buf = [0u8; 2];
                     while received_by_this_consumer < expected_for_this_consumer {
-                        match tokio::time::timeout(Duration::from_secs(5), ws_rx.next()).await {
-                            Ok(Some(Ok(msg))) => {
-                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                if let tokio_tungstenite::tungstenite::Message::Binary(data) = msg {
-                                    // Binary: [2 bytes topic_len][topic bytes][payload bytes]
-                                    if data.len() < 2 {
-                                        continue;
-                                    }
-                                    let topic_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-                                    if data.len() < 2 + topic_len {
-                                        continue;
-                                    }
-                                    let received_topic = String::from_utf8_lossy(&data[2..2 + topic_len]);
-                                    if received_topic != topic_name {
-                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
-                                        std::process::exit(1);
-                                    }
-
-                                    let payload_bytes = &data[2 + topic_len..];
-                                    let payload_str = String::from_utf8_lossy(payload_bytes);
-                                    let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
-                                    if parts.len() >= 3 {
-                                        if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                            let latency = (now.saturating_sub(sent_at)) as u64;
-                                            let _ = local_e2e.record(latency);
+                        match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut len_buf)).await {
+                            Ok(Ok(2)) => {
+                                let total_len = u16::from_be_bytes(len_buf) as usize;
+                                let mut msg_buf = vec![0u8; total_len];
+                                match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut msg_buf)).await {
+                                    Ok(Ok(_)) => {
+                                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                        let msg_type = msg_buf[0];
+                                        if msg_type == 0x03 { // MSG_SUBSCRIBE_DATA
+                                            let payload_data = &msg_buf[1..];
+                                            if payload_data.len() < 4 {
+                                                continue;
+                                            }
+                                            // Format: topic_len(2) + topic + payload_len(2) + payload_data
+                                            let t_len = u16::from_be_bytes([payload_data[0], payload_data[1]]) as usize;
+                                            if payload_data.len() < 2 + t_len + 2 {
+                                                continue;
+                                            }
+                                            let received_topic = String::from_utf8_lossy(&payload_data[2..2 + t_len]);
+                                            if received_topic != topic_name {
+                                                eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
+                                                std::process::exit(1);
+                                            }
+                                            let p_offset = 2 + t_len + 2;
+                                            let payload_bytes = &payload_data[p_offset..];
+                                            let payload_str = String::from_utf8_lossy(payload_bytes);
+                                            let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
+                                            if parts.len() >= 3 {
+                                                if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                                    let latency = (now.saturating_sub(sent_at)) as u64;
+                                                    let _ = local_e2e.record(latency);
+                                                }
+                                            }
+                                            total_received.fetch_add(1, Ordering::Relaxed);
+                                            received_by_this_consumer += 1;
                                         }
                                     }
-
-                                    total_received.fetch_add(1, Ordering::Relaxed);
-                                    received_by_this_consumer += 1;
+                                    _ => break,
                                 }
                             }
-                            Ok(Some(Err(e))) => {
-                                eprintln!("Consumer {} WebSocket error: {:?}", consumer_id, e);
-                                break;
-                            }
-                            Ok(None) => break,
-                            Err(_) => {
-                                eprintln!("Consumer {} timed out waiting for message (received {}/{})", consumer_id, received_by_this_consumer, expected_for_this_consumer);
-                                break;
-                            }
+                            _ => break,
                         }
                     }
                 }
@@ -286,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
+    // ─── Producers ──────────────────────────────────────────────
     for prod_id in 0..num_producers {
         let b = Arc::clone(&barrier);
         let sb = Arc::clone(&start_barrier);
@@ -293,15 +209,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg_count = args.messages_per_conn;
         let payload = Arc::clone(&payload);
         let pub_ack_hist = Arc::clone(&pub_ack_hist);
-        let redis_url = args.redis_url.clone();
-        let hugimq_url = args.hugimq_url.clone();
-        let hugimq_ws_url = args.hugimq_ws_url.clone();
+        let url = args.url.clone();
         let total_topics = args.topics;
         let topics_per_prod = args.topics_per_producer;
 
         handles.push(tokio::spawn(async move {
             let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 300_000_000_000, 3).unwrap();
-            
+
             // Each producer has a set of topics it cycles through
             let my_topics: Vec<String> = (0..topics_per_prod)
                 .map(|i| {
@@ -311,76 +225,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
 
             match target {
-                Target::Redis => {
-                    let client = redis::Client::open(redis_url.as_str()).unwrap();
-                    let mut con = client.get_async_connection().await.unwrap();
-
-                    b.wait().await;
-                    sb.wait().await;
-
-                    for seq in 0..msg_count {
-                        let topic_name = &my_topics[seq % my_topics.len()];
-                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                        let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
-
-                        let ack_start = Instant::now();
-                        let _: () = con.publish(topic_name, msg).await.unwrap();
-                        let ack_latency = ack_start.elapsed().as_nanos() as u64;
-                        let _ = local_pub_ack.record(ack_latency);
-                    }
-                }
-                Target::Hugimq => {
-                    let mut client = HugiMqServiceClient::connect(hugimq_url.to_string()).await.unwrap();
-                    b.wait().await;
-                    sb.wait().await;
-
-                    let (tx, rx) = tokio::sync::mpsc::channel(1024);
-                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-
-                    let stream_start = Instant::now();
-                    let response_handle = tokio::spawn(async move {
-                        client.publish(stream).await
-                    });
-
-                    for seq in 0..msg_count {
-                        let topic_name = &my_topics[seq % my_topics.len()];
-                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                        let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
-
-                        if let Err(_) = tx.send(PublishRequest {
-                            topic: topic_name.clone(),
-                            payload: msg.into_bytes().into(),
-                        }).await {
-                            break;
-                        }
-                    }
-                    drop(tx);
-
-                    let stream_duration = match response_handle.await {
-                        Ok(Ok(resp)) => {
-                            if !resp.get_ref().ok {
-                                eprintln!("Producer {} failed: server returned not ok", prod_id);
-                            }
-                            stream_start.elapsed().as_nanos() as u64
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!("Producer {} streaming error: {:?}", prod_id, e);
-                            stream_start.elapsed().as_nanos() as u64
-                        }
-                        Err(e) => {
-                            eprintln!("Producer {} handle error: {:?}", prod_id, e);
-                            stream_start.elapsed().as_nanos() as u64
-                        }
-                    };
-                    // Record the total stream duration as the producer ACK latency.
-                    // This measures the true round-trip time from first message sent
-                    // to server acknowledgment of the complete stream.
-                    let _ = local_pub_ack.record(stream_duration);
-                }
-                Target::HugimqWs => {
-                    let ws_url = format!("{}/ws/publish", hugimq_ws_url);
-                    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-                    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+                Target::Tcp => {
+                    let stream = tokio::net::TcpStream::connect(url.replace("tcp://", ""))
+                        .await
+                        .unwrap();
+                    let (mut reader, mut writer) = tokio::io::split(stream);
 
                     b.wait().await;
                     sb.wait().await;
@@ -392,25 +241,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
-                        // Binary format: [2 bytes topic_len][topic bytes][payload bytes]
+                        // Binary format: [2 bytes total_len][1 byte type][2 bytes topic_len][topic][payload]
                         let topic_bytes = topic_name.as_bytes();
                         let topic_len = topic_bytes.len() as u16;
                         let payload_bytes = msg.as_bytes();
-                        let mut frame = Vec::with_capacity(2 + topic_bytes.len() + payload_bytes.len());
+                        let total_len = 1 + 2 + topic_bytes.len() + payload_bytes.len();
+                        let mut frame = Vec::with_capacity(2 + total_len);
+                        frame.extend_from_slice(&(total_len as u16).to_be_bytes());
+                        frame.push(0x02); // MSG_PUBLISH
                         frame.extend_from_slice(&topic_len.to_be_bytes());
                         frame.extend_from_slice(topic_bytes);
                         frame.extend_from_slice(payload_bytes);
 
-                        if let Err(_) = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await {
+                        if writer.write_all(&frame).await.is_err() {
                             break;
                         }
                     }
 
                     // Drain all server ACKs
+                    let mut len_buf = [0u8; 2];
                     loop {
-                        match tokio::time::timeout(Duration::from_secs(5), ws_rx.next()).await {
-                            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))) => continue,
-                            Ok(Some(Ok(_))) => continue, // Skip any unexpected message types
+                        match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut len_buf)).await {
+                            Ok(Ok(2)) => {
+                                let total_len = u16::from_be_bytes(len_buf) as usize;
+                                let mut buf = vec![0u8; total_len];
+                                match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut buf)).await {
+                                    Ok(Ok(_)) => continue,
+                                    _ => break,
+                                }
+                            }
                             _ => break,
                         }
                     }
