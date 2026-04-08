@@ -144,7 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     frame.extend_from_slice(topic_bytes);
                     writer.write_all(&frame).await.unwrap();
 
-                    // Subscribe BEFORE the barriers so we're ready when producers start.
+                    // Wait for server ACK (1 byte) confirming subscriber registration
+                    let mut ack_buf = [0u8; 1];
+                    reader.read_exact(&mut ack_buf).await.unwrap();
+
+                    // Subscribe confirmed by server BEFORE barriers — no startup race
                     b.wait().await;
                     sb.wait().await;
 

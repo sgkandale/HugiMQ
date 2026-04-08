@@ -5,9 +5,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -22,12 +23,10 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity.
-/// 4096 matches the gRPC Step 2.3 setting — small enough to apply backpressure
-/// immediately, large enough to absorb short burst jitter.
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
 
 struct Topic {
-    subscribers: tokio::sync::RwLock<Vec<mpsc::Sender<Message>>>,
+    subscribers: RwLock<Vec<mpsc::Sender<Message>>>,
     subscriber_count: AtomicUsize,
 }
 
@@ -54,7 +53,6 @@ impl Decoder for FrameCodec {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Need at least 3 bytes: 2 length + 1 type
         if src.len() < 3 {
             return Ok(None);
         }
@@ -62,7 +60,7 @@ impl Decoder for FrameCodec {
         if src.len() < 2 + total_len {
             return Ok(None);
         }
-        src.advance(2); // skip length field
+        src.advance(2);
         let msg_type = src.get_u8();
         let payload = src.split_to(total_len - 1).to_vec();
         Ok(Some((msg_type, payload)))
@@ -91,7 +89,7 @@ fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
         .entry(topic.to_string())
         .or_insert_with(|| {
             Arc::new(Topic {
-                subscribers: tokio::sync::RwLock::new(Vec::new()),
+                subscribers: RwLock::new(Vec::new()),
                 subscriber_count: AtomicUsize::new(0),
             })
         })
@@ -101,8 +99,6 @@ fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
 // ─── Connection handler ──────────────────────────────────────────────
 
 async fn handle_raw_tcp_connection(mut stream: tokio::net::TcpStream, state: Arc<AppState>) {
-    // Read the first frame header to determine connection type
-    // Format: [2 bytes total_len][1 byte type][...]
     let mut header = [0u8; 3];
     if stream.read_exact(&mut header).await.is_err() {
         return;
@@ -110,8 +106,7 @@ async fn handle_raw_tcp_connection(mut stream: tokio::net::TcpStream, state: Arc
     let total_len = u16::from_be_bytes([header[0], header[1]]) as usize;
     let msg_type = header[2];
 
-    // Read the rest of the first frame's payload
-    let remaining = total_len - 1; // subtract the type byte
+    let remaining = total_len - 1;
     let mut first_payload = vec![0u8; remaining];
     if stream.read_exact(&mut first_payload).await.is_err() {
         return;
@@ -122,7 +117,6 @@ async fn handle_raw_tcp_connection(mut stream: tokio::net::TcpStream, state: Arc
             handle_publish_connection(stream, &first_payload, state).await;
         }
         MSG_SUBSCRIBE => {
-            // Parse topic from first frame payload: [2 bytes topic_len][topic]
             if first_payload.len() < 2 {
                 return;
             }
@@ -147,11 +141,8 @@ async fn handle_publish_connection(
     let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
     let mut stream = stream;
 
-    // Process first message
     process_publish_payload(first_payload, &mut cache, &state).await;
 
-    // Continue reading subsequent frames
-    // Each frame: [2 bytes total_len][1 byte type][payload]
     let mut len_buf = [0u8; 2];
     loop {
         if stream.read_exact(&mut len_buf).await.is_err() {
@@ -162,7 +153,6 @@ async fn handle_publish_connection(
         if stream.read_exact(&mut frame).await.is_err() {
             break;
         }
-        // frame[0] = type, frame[1..] = payload
         if frame[0] != MSG_PUBLISH {
             continue;
         }
@@ -175,7 +165,6 @@ async fn process_publish_payload(
     cache: &mut Vec<(String, Arc<Topic>)>,
     state: &Arc<AppState>,
 ) {
-    // Format: [2 bytes topic_len][topic][message payload]
     if payload.len() < 2 {
         return;
     }
@@ -201,11 +190,12 @@ async fn process_publish_payload(
         payload: Arc::new(bytes::Bytes::from(msg_payload)),
     };
 
-    let subs: Vec<mpsc::Sender<Message>> = {
-        let subs = topic.subscribers.read().await;
-        subs.iter().cloned().collect()
+    let subs = {
+        let guard = topic.subscribers.read().await;
+        guard.iter().cloned().collect::<Vec<_>>()
     };
 
+    // Serial send().await with backpressure — correct for tokio runtime scheduling.
     let mut dead_indices = Vec::new();
     for (i, sub) in subs.iter().enumerate() {
         if sub.send(message.clone()).await.is_err() {
@@ -237,10 +227,15 @@ async fn handle_subscribe_connection(
         topic.subscriber_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Send 1-byte ACK so the consumer knows it's registered.
+    let mut stream = stream;
+    if stream.write_all(&[0x00]).await.is_err() {
+        return;
+    }
+
     let mut framed = Framed::new(stream, FrameCodec);
 
     while let Some(msg) = rx.recv().await {
-        // Format: [2 bytes topic_len][topic][2 bytes payload_len][payload]
         let topic_bytes = topic_name.as_bytes();
         let topic_len = topic_bytes.len() as u16;
         let payload_len = msg.payload.len() as u16;
@@ -260,7 +255,10 @@ async fn handle_subscribe_connection(
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
