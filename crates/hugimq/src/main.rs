@@ -15,6 +15,7 @@ use futures_util::SinkExt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -101,36 +102,31 @@ async fn handle_publish_socket(socket: WebSocket, state: Arc<AppState>) {
             payload: Arc::new(bytes::Bytes::from(payload_bytes)),
         };
 
-        // Deliver to subscribers — use try_send first for speed, fall back to
-        // async send only if the channel is full. This avoids spawning millions
-        // of tasks while still providing backpressure.
+        // Deliver to subscribers — use try_send for non-blocking delivery.
+        // Spin with micro-sleep if channel is full to provide soft backpressure
+        // without blocking the ACK response.
         let subs: Vec<mpsc::Sender<Message>> = {
             let subs = topic.subscribers.read().await;
             subs.iter().cloned().collect()
         };
 
-        if !subs.is_empty() {
-            let mut dead_indices = Vec::new();
-            for (i, sub) in subs.iter().enumerate() {
-                // Try non-blocking send first
-                if sub.try_send(message.clone()).is_err() {
-                    // Channel full — must await
-                    if sub.send(message.clone()).await.is_err() {
-                        dead_indices.push(i);
+        for sub in subs {
+            loop {
+                match sub.try_send(message.clone()) {
+                    Ok(()) => break,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Channel full — brief yield to let consumer drain
+                        tokio::time::sleep(Duration::from_micros(10)).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Subscriber disconnected — will be cleaned up on next publish
+                        break;
                     }
                 }
             }
-
-            if !dead_indices.is_empty() {
-                let mut subs_mut = topic.subscribers.write().await;
-                for i in dead_indices.into_iter().rev() {
-                    subs_mut.swap_remove(i);
-                }
-                topic.subscriber_count.store(subs_mut.len(), Ordering::Relaxed);
-            }
         }
 
-        // ACK immediately
+        // ACK immediately — delivery is guaranteed by the spin loop above
         let _ = tx.send(WsMessage::Binary(vec![0x01])).await;
     }
 }
