@@ -196,34 +196,27 @@ async fn handle_subscribe_connection(
         return;
     }
 
-    // OPTIMIZATION: Write batching — match HTTP/2's 64KB flow control window.
-    // After recv().await for the first message, try_recv() drains all buffered
-    // messages. All are encoded into one buffer, then written+flushed in ONE syscall.
-    // This reduces subscribe-path syscalls from 100M to ~1.5M (same ratio as gRPC).
+    // Write batching: after recv().await for the first message, try_recv() drains
+    // all remaining buffered messages. All encoded into one 64KB buffer, then
+    // write_all + flush in ONE syscall — matching HTTP/2's 64KB flow control window.
+    const WRITE_BUF_SIZE: usize = 64 * 1024;
+    let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
     let topic_bytes = topic_name.as_bytes();
     let topic_len = topic_bytes.len() as u16;
 
-    // 64KB write buffer — matches HTTP/2's default flow control window
-    const WRITE_BUF_SIZE: usize = 64 * 1024;
-    let mut write_buf = Vec::with_capacity(WRITE_BUF_SIZE);
-
     loop {
-        // Block until at least one message is available
         let msg = match rx.recv().await {
             Some(msg) => msg,
-            None => break, // channel closed
+            None => break,
         };
 
-        // Encode the first message
         encode_subscribe_data(&msg, topic_bytes, topic_len, &mut write_buf);
 
-        // Drain all remaining buffered messages (non-blocking, same consumer task)
+        // Drain remaining buffered messages (non-blocking, same consumer task)
         while write_buf.len() < WRITE_BUF_SIZE {
             match rx.try_recv() {
-                Ok(msg) => {
-                    encode_subscribe_data(&msg, topic_bytes, topic_len, &mut write_buf);
-                }
-                Err(_) => break, // channel empty or closed
+                Ok(msg) => encode_subscribe_data(&msg, topic_bytes, topic_len, &mut write_buf),
+                Err(_) => break,
             }
         }
 
@@ -239,14 +232,8 @@ async fn handle_subscribe_connection(
 }
 
 /// Encode a SUBSCRIBE_DATA frame into the write buffer.
-/// Format: [2 bytes total_len][1 byte MSG_SUBSCRIBE_DATA][2 bytes topic_len][topic][2 bytes payload_len][payload]
 #[inline]
-fn encode_subscribe_data(
-    msg: &Message,
-    topic_bytes: &[u8],
-    topic_len: u16,
-    buf: &mut Vec<u8>,
-) {
+fn encode_subscribe_data(msg: &Message, topic_bytes: &[u8], topic_len: u16, buf: &mut Vec<u8>) {
     let payload_len = msg.payload.len() as u16;
     let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
     buf.put_u16(total_len as u16);
