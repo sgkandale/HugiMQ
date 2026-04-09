@@ -1,24 +1,18 @@
-use bytes::{Buf, BytesMut};
+use bytes::BufMut;
 use clap::{Parser, ValueEnum};
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Barrier, Mutex};
-use tokio::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, Ordering};
 use hdrhistogram::Histogram;
-use std::time::SystemTime;
-
-/// Read buffer size — 64KB per syscall
-const READ_BUF_SIZE: usize = 64 * 1024;
-/// Write batch size — 64KB per syscall
-const WRITE_BATCH_SIZE: usize = 64 * 1024;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::net::UdpSocket;
+use tokio::sync::{Barrier, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
     about = "High-performance pub/sub benchmarker",
-    after_help = "EXAMPLES:\n  Run TCP benchmark:\n    cargo run --release -p benchmarker -- tcp --connections 20 --messages-per-conn 50000\n\n  Test with 5KB payloads:\n    cargo run --release -p benchmarker -- tcp --payload-size 5120"
 )]
 struct Args {
     #[arg(help = "The system to benchmark")]
@@ -33,7 +27,7 @@ struct Args {
     #[arg(short, long, default_value_t = 128)]
     payload_size: usize,
 
-    #[arg(long, default_value = "tcp://127.0.0.1:6379")]
+    #[arg(long, default_value = "udp://127.0.0.1:6379")]
     url: String,
 
     #[arg(long, default_value_t = 1)]
@@ -46,8 +40,11 @@ struct Args {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 #[value(rename_all = "lowercase")]
 enum Target {
-    Tcp,
+    Udp,
 }
+
+/// Max UDP datagram size
+const MAX_DATAGRAM_SIZE: usize = 65507;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,15 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_producers = args.connections / 2;
     let num_consumers = args.connections - num_producers;
 
-    // Calculate total expected deliveries based on how topics are distributed.
-    // Each producer publishes to topics_per_producer topics. Each consumer subscribes to ONE topic.
-    // A message is delivered to all consumers on that topic.
+    // Calculate total expected deliveries
     let mut total_expected_deliveries = 0u64;
     for p_id in 0..num_producers {
         for i in 0..args.topics_per_producer {
             let topic_idx = (p_id + i) % args.topics;
             let consumers_on_topic = (0..num_consumers).filter(|&c_id| c_id % args.topics == topic_idx).count();
-            // We distribute the messages_per_conn across the chosen topics
             let msgs_on_this_topic = args.messages_per_conn / args.topics_per_producer;
             total_expected_deliveries += (msgs_on_this_topic * consumers_on_topic) as u64;
         }
@@ -108,6 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Spawning {} consumers and {} producers...", num_consumers, num_producers);
 
+    // Parse server address
+    let server_addr = args.url.replace("udp://", "");
+
     // ─── Consumers ──────────────────────────────────────────────
     for consumer_id in 0..num_consumers {
         let total_received = Arc::clone(&total_received);
@@ -115,15 +112,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sb = Arc::clone(&start_barrier);
         let target = args.target;
         let e2e_hist = Arc::clone(&e2e_hist);
-        let url = args.url.clone();
+        let server_addr = server_addr.clone();
         let topic_idx = consumer_id % args.topics;
         let topic_name = format!("benchmark_topic_{}", topic_idx);
 
-        // Each consumer expects messages from all producers on the SAME topic.
-        // Each producer splits its messages across topics_per_producer topics,
-        // so we divide messages_per_conn accordingly.
         let producers_on_topic = (0..num_producers).filter(|&p_id| {
-            // A producer publishes to topic_idx if topic_idx is in its range [p_id, p_id + topics_per_producer)
             (0..args.topics_per_producer).any(|i| (p_id + i) % args.topics == topic_idx)
         }).count();
         let expected_for_this_consumer = (args.messages_per_conn / args.topics_per_producer * producers_on_topic) as u64;
@@ -133,103 +126,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut local_e2e = Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).unwrap();
 
             match target {
-                Target::Tcp => {
-                    let stream = tokio::net::TcpStream::connect(url.replace("tcp://", ""))
-                        .await
-                        .unwrap();
-                    let (mut reader, mut writer) = tokio::io::split(stream);
-
-                    // Send subscribe message: [2 bytes total_len][1 byte type][2 bytes topic_len][topic]
+                Target::Udp => {
+                    // Bind to ephemeral port with large receive buffer
+                    let std_socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+                    // 64MB receive buffer to handle burst traffic
+                    const SOCKET_BUF_SIZE: libc::c_int = 64 * 1024 * 1024;
+                    let fd = std_socket.as_raw_fd();
+                    unsafe {
+                        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                            &SOCKET_BUF_SIZE as *const _ as *const _, std::mem::size_of::<libc::c_int>() as u32);
+                    }
+                    let socket = UdpSocket::from_std(std_socket).unwrap();
+                    
+                    // Send SUBSCRIBE: [1 byte: 0x01][2 bytes: topic_len][topic]
                     let topic_bytes = topic_name.as_bytes();
                     let topic_len = topic_bytes.len() as u16;
-                    let total_len = 1 + 2 + topic_bytes.len();
-                    let mut frame = Vec::with_capacity(2 + total_len);
-                    frame.extend_from_slice(&(total_len as u16).to_be_bytes());
-                    frame.push(0x01); // MSG_SUBSCRIBE
-                    frame.extend_from_slice(&topic_len.to_be_bytes());
-                    frame.extend_from_slice(topic_bytes);
-                    writer.write_all(&frame).await.unwrap();
+                    let mut subscribe_msg = Vec::with_capacity(1 + 2 + topic_bytes.len());
+                    subscribe_msg.push(0x01); // MSG_SUBSCRIBE
+                    subscribe_msg.put_u16(topic_len);
+                    subscribe_msg.extend_from_slice(topic_bytes);
+                    
+                    socket.send_to(&subscribe_msg, &server_addr).await.unwrap();
 
-                    // Wait for server ACK (1 byte) confirming subscriber registration
-                    let mut ack_buf = [0u8; 1];
-                    reader.read_exact(&mut ack_buf).await.unwrap();
-
-                    // Subscribe confirmed by server BEFORE barriers — no startup race
+                    // Subscribe confirmed before barrier — no startup race
                     b.wait().await;
                     sb.wait().await;
 
-                    // Read loop: buffered read — parse multiple frames from one 64KB read syscall
-                    // instead of two read_exact() calls per message.
-                    let mut read_buf = BytesMut::with_capacity(READ_BUF_SIZE);
-                    let mut read_bytes = [0u8; READ_BUF_SIZE];
-
+                    // Receive loop
+                    let mut buf = [0u8; MAX_DATAGRAM_SIZE];
                     while received_by_this_consumer < expected_for_this_consumer {
-                        // Ensure we have at least 3 bytes (header)
-                        while read_buf.len() < 3 {
-                            let n = match tokio::time::timeout(
-                                Duration::from_secs(5),
-                                reader.read(&mut read_bytes),
-                            ).await {
-                                Ok(Ok(n)) if n > 0 => n,
-                                _ => break,
-                            };
-                            read_buf.extend_from_slice(&read_bytes[..n]);
-                        }
-
-                        if read_buf.len() < 3 {
-                            break; // timeout or EOF
-                        }
-
-                        let total_len = u16::from_be_bytes([read_buf[0], read_buf[1]]) as usize;
-                        let frame_len = 2 + total_len;
-
-                        // If we don't have the full frame, read more
-                        while read_buf.len() < frame_len {
-                            let remaining = frame_len - read_buf.len();
-                            let to_read = remaining.min(read_bytes.len());
-                            let n = match tokio::time::timeout(
-                                Duration::from_secs(5),
-                                reader.read(&mut read_bytes[..to_read]),
-                            ).await {
-                                Ok(Ok(n)) if n > 0 => n,
-                                _ => break,
-                            };
-                            read_buf.extend_from_slice(&read_bytes[..n]);
-                        }
-
-                        if read_buf.len() < frame_len {
-                            break; // timeout
-                        }
-
-                        let msg_type = read_buf[2];
-                        if msg_type == 0x03 { // MSG_SUBSCRIBE_DATA
-                            let payload_data = &read_buf[3..frame_len];
-                            if payload_data.len() >= 4 {
-                                let t_len = u16::from_be_bytes([payload_data[0], payload_data[1]]) as usize;
-                                if payload_data.len() >= 2 + t_len + 2 {
-                                    let received_topic = String::from_utf8_lossy(&payload_data[2..2 + t_len]);
-                                    if received_topic != topic_name {
-                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
-                                        std::process::exit(1);
-                                    }
-                                    let p_offset = 2 + t_len + 2;
-                                    let payload_bytes = &payload_data[p_offset..];
-                                    let payload_str = String::from_utf8_lossy(payload_bytes);
-                                    let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
-                                    if parts.len() >= 3 {
-                                        if let Ok(sent_at) = parts[2].parse::<u128>() {
-                                            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                            let latency = (now.saturating_sub(sent_at)) as u64;
-                                            let _ = local_e2e.record(latency);
-                                        }
-                                    }
-                                    total_received.fetch_add(1, Ordering::Relaxed);
-                                    received_by_this_consumer += 1;
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            socket.recv_from(&mut buf),
+                        ).await {
+                            Ok(Ok((len, _))) => {
+                                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                
+                                // Parse SUBSCRIBE_DATA: [2 bytes: topic_len][topic][2 bytes: payload_len][payload]
+                                if len < 4 {
+                                    continue;
                                 }
+                                let t_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                                if len < 2 + t_len + 2 {
+                                    continue;
+                                }
+                                let received_topic = String::from_utf8_lossy(&buf[2..2 + t_len]);
+                                if received_topic != topic_name {
+                                    eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
+                                    std::process::exit(1);
+                                }
+                                let p_offset = 2 + t_len + 2;
+                                let payload_bytes = &buf[p_offset..len];
+                                let payload_str = String::from_utf8_lossy(payload_bytes);
+                                let parts: Vec<&str> = payload_str.splitn(5, ':').collect();
+                                if parts.len() >= 3 {
+                                    if let Ok(sent_at) = parts[2].parse::<u128>() {
+                                        let latency = (now.saturating_sub(sent_at)) as u64;
+                                        let _ = local_e2e.record(latency);
+                                    }
+                                }
+                                total_received.fetch_add(1, Ordering::Relaxed);
+                                received_by_this_consumer += 1;
                             }
+                            _ => break,
                         }
-
-                        read_buf.advance(frame_len);
                     }
                 }
             }
@@ -246,14 +206,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg_count = args.messages_per_conn;
         let payload = Arc::clone(&payload);
         let pub_ack_hist = Arc::clone(&pub_ack_hist);
-        let url = args.url.clone();
+        let server_addr = server_addr.clone();
         let total_topics = args.topics;
         let topics_per_prod = args.topics_per_producer;
 
         handles.push(tokio::spawn(async move {
             let mut local_pub_ack = Histogram::<u64>::new_with_bounds(1, 300_000_000_000, 3).unwrap();
 
-            // Each producer has a set of topics it cycles through
             let my_topics: Vec<String> = (0..topics_per_prod)
                 .map(|i| {
                     let idx = (prod_id + i) % total_topics;
@@ -262,61 +221,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
 
             match target {
-                Target::Tcp => {
-                    let stream = tokio::net::TcpStream::connect(url.replace("tcp://", ""))
-                        .await
-                        .unwrap();
-                    let (mut reader, mut writer) = tokio::io::split(stream);
+                Target::Udp => {
+                    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
 
                     b.wait().await;
                     sb.wait().await;
 
                     let publish_start = Instant::now();
-                    let mut write_buf = Vec::with_capacity(WRITE_BATCH_SIZE);
 
                     for seq in 0..msg_count {
                         let topic_name = &my_topics[seq % my_topics.len()];
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         let msg = format!("{}:{}:{}:{}:{}", prod_id, seq, now, topic_name, payload);
 
+                        // PUBLISH: [1 byte: 0x02][2 bytes: topic_len][topic][payload]
                         let topic_bytes = topic_name.as_bytes();
                         let topic_len = topic_bytes.len() as u16;
                         let payload_bytes = msg.as_bytes();
-                        let total_len = 1 + 2 + topic_bytes.len() + payload_bytes.len();
+                        let mut frame = Vec::with_capacity(1 + 2 + topic_bytes.len() + payload_bytes.len());
+                        frame.push(0x02); // MSG_PUBLISH
+                        frame.put_u16(topic_len);
+                        frame.extend_from_slice(topic_bytes);
+                        frame.extend_from_slice(payload_bytes);
 
-                        write_buf.extend_from_slice(&(total_len as u16).to_be_bytes());
-                        write_buf.push(0x02); // MSG_PUBLISH
-                        write_buf.extend_from_slice(&topic_len.to_be_bytes());
-                        write_buf.extend_from_slice(topic_bytes);
-                        write_buf.extend_from_slice(payload_bytes);
-
-                        // Flush when batch exceeds 64KB
-                        if write_buf.len() >= WRITE_BATCH_SIZE {
-                            if writer.write_all(&write_buf).await.is_err() {
-                                break;
-                            }
-                            write_buf.clear();
-                        }
-                    }
-                    // Flush remaining
-                    if !write_buf.is_empty() {
-                        let _ = writer.write_all(&write_buf).await;
-                    }
-                    let _ = writer.flush().await;
-
-                    // Drain all server ACKs
-                    let mut len_buf = [0u8; 2];
-                    loop {
-                        match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut len_buf)).await {
-                            Ok(Ok(2)) => {
-                                let total_len = u16::from_be_bytes(len_buf) as usize;
-                                let mut buf = vec![0u8; total_len];
-                                match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut buf)).await {
-                                    Ok(Ok(_)) => continue,
-                                    _ => break,
-                                }
-                            }
-                            _ => break,
+                        if socket.send_to(&frame, &server_addr).await.is_err() {
+                            break;
                         }
                     }
 

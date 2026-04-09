@@ -10,8 +10,8 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 bytes = "1.6.0"
 dashmap = "6.1.0"
 jemallocator = "0.5"
-libc = "0.2"
 arc-swap = "1.7"
+libc = "0.2"
 
 [[bin]]
 name = "hugimq-server"
