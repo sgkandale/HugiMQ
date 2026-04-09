@@ -3,10 +3,14 @@ use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use std::os::fd::AsRawFd;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Message types
@@ -266,6 +270,29 @@ async fn main() {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let _ = stream.set_nodelay(true);
+
+                // Socket buffer tuning: 4MB receive and send buffers
+                // Kernel default is ~212KB. At multi-MB/s throughput, small buffers
+                // cause TCP window stalls when the kernel can't ack fast enough.
+                const SOCKET_BUF_SIZE: libc::c_int = 4 * 1024 * 1024; // 4MB
+                let fd = stream.as_raw_fd();
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &SOCKET_BUF_SIZE as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as u32,
+                    );
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &SOCKET_BUF_SIZE as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as u32,
+                    );
+                }
+
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     handle_raw_tcp_connection(stream, state).await;
