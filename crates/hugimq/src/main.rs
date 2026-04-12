@@ -35,7 +35,7 @@ const MSG_PUBLISH: u8 = 0x02;
 const MAX_DATAGRAM: usize = 65507;
 
 /// Number of cores for SO_REUSEPORT socket distribution
-const NUM_CORES: usize = 4;
+const NUM_CORES: usize = 1;
 
 /// Ring buffer capacity per subscriber (power of 2)
 const RING_BUFFER_SIZE: usize = 1_048_576; // 1M slots — ~400MB per subscriber
