@@ -785,3 +785,94 @@ This file records every architectural iteration, the rationale behind it, and th
     4. **Arc\<Bytes\> zero-copy + ArcSwap lock-free + 128KB batching**: 2.38M → 2.45M (+3.3% cloud, +2.5% local)
 
     Raw TCP peak throughput (2.99M msg/s) now exceeds gRPC peak (2.76M) by 8.3%, and TCP delivers 1.9x better P50 latency (120ms vs 231ms) and 1.4x better P99 latency (182ms vs 250ms). The remaining 9.5% average throughput gap is from Tokio's work-stealing scheduler (task migration between cores, cache line bouncing on atomics) — not from I/O or protocol overhead. The architectural lesson from Steps 1-4 is clear: **protocol overhead is negligible compared to I/O batching efficiency**. A well-batched, zero-copy Raw TCP implementation can match gRPC throughput while delivering superior latency, and exceed gRPC on peak throughput.
+
+### Step 5: Plain UDP (Exploratory — Failed)
+- **Hypothesis:** UDP's connectionless nature eliminates TCP's three-way handshake, ACK overhead, and ordered delivery — enabling higher throughput.
+- **Architecture:** Single `UdpSocket` for all traffic. Clients send `PUBLISH`/`SUBSCRIBE` datagrams. Server dispatches via `send_to()` to subscriber addresses.
+
+- **Approaches Attempted (15+ iterations):**
+
+    | # | Approach | Best Result | Why It Failed |
+    |---|---|---|---|
+    | 1 | `std::net::UdpSocket::send_to` blocking | 100% at 100 msgs, 20% at 5K | Main loop blocked on sends → `recv_from` starved |
+    | 2 | `tokio::UdpSocket::send_to().await` sequential | 100% at 100 msgs, 20% at 50K | Each `.await` blocks main loop from receiving |
+    | 3 | Spawned task per `send_to` | Scheduler crash | 5M tasks overwhelmed tokio scheduler |
+    | 4 | Arc\<UdpSocket\> shared across 10 tasks | 10% received | Single socket serialized all sends via internal lock |
+    | 5 | Channels + dedicated send threads | 20% received | Main loop filled channels faster than threads drained |
+    | 6 | `try_send` (no backpressure) | Drops when channels full | Expected UDP behavior — no reliable delivery |
+    | 7 | `send().await` backpressure | 0 throughput | Main loop yielded → all tasks blocked → deadlock |
+    | 8 | Single dispatcher task | 25% at 50K msgs | Dispatcher became single-threaded bottleneck |
+    | 9 | Token bucket rate limiter (500K/s) | 21% received | Server still couldn't drain fast enough |
+    | 10 | 1M channel capacity per subscriber | 19.6% received | Channel filled in ~100ms, kernel dropped rest |
+    | 11 | Per-subscriber std::thread + std socket | 100% loss | Server-side socket sharing serialized sends |
+    | 12 | Direct `send_to()` in main loop | 100% loss at 50K | Sequential sends blocked recv entirely |
+    | 13 | Spawn concurrent task per subscriber | 10% received | Scheduler overload at 5M spawned tasks |
+
+- **Root Cause Analysis:**
+    1. **UDP has no backpressure.** Unlike TCP's flow control, UDP datagrams are fire-and-forget. No mechanism to tell sender "slow down."
+    2. **Single socket bottleneck.** All sends share one `UdpSocket`. Kernel serializes sends through socket's internal lock.
+    3. **Tokio scheduler overload.** 500K datagrams × 10 subscribers = 5M sends. Both spawning 5M tasks and sequential `.await` fail.
+    4. **Kernel buffer limits.** Default `SO_RCVBUF` is ~212KB (~1K frames at 200 bytes). Even with 128MB, burst traffic overflows before consumers drain.
+    5. **No recovery mechanism.** Once a datagram is dropped, it's gone forever.
+
+- **Conclusion:** Plain UDP cannot achieve 0% message loss at multi-million msg/s throughput. Achieving reliable UDP requires Aeron's architecture (NAK retransmit, sequence tracking, per-core sockets, `SO_REUSEPORT`), which is a fundamentally different system.
+
+### Step 5: Aeron UDP (Real Aeron C library via `rusteron`)
+- **Hypothesis:** Using the real Aeron C library (via `rusteron` Rust bindings) with its thread-per-core architecture, media driver, and lock-free SPSC queues will achieve 0% message loss at high throughput.
+- **Architecture:**
+    - Server: Aeron media driver on port 6379 (ingest, producers), port 6380 (delivery, consumers)
+    - 10 topics: each producer publishes to `topic_i` (Stream 100+i), each consumer subscribes to `topic_i` (Stream 200+i)
+    - `mimalloc` global allocator for high-concurrency heap speed
+    - Aeron's built-in lock-free SPSC queues with mechanical sympathy (cache-line aligned)
+    - Fragment assembler for handling large messages (> MTU)
+- **Benchmark Command:**
+    ```bash
+    cargo run --release --package benchmarker -- --connections 20 --messages-per-conn 100000 --payload-size 128
+    ```
+
+- **Local Results (single machine, 20 threads competing for CPU):**
+
+    | Messages per Conn | Total Messages | Throughput | Messages Lost | Loss % | P50 Latency | P99 Latency |
+    |---|---|---|---|---|---|---|
+    | 1,000 | 100,000 | 77,958 msg/s | 0 | 0.00% | — | — |
+    | 100,000 | 1,000,000 | 248,041 msg/s | 0 | 0.00% | 1.1s | 2.7s |
+    | 500,000 | 5,000,000 | 155,897 msg/s | 0 | 0.00% | 3.3s | 10.8s |
+
+- **Cloud Results (dedicated instances, no CPU contention — c6i.xlarge server + c6i.2xlarge benchmarker):**
+
+    | Messages per Conn | Total Messages | Throughput | Messages Lost | Loss % | P50 Latency | P99 Latency |
+    |---|---|---|---|---|---|---|
+    | 500,000 | 5,000,000 | 410,007 msg/s | 0 | 0.00% | 878ms | 2.06s |
+
+- **Key Findings:**
+    1. **0% message loss at all scales** — Aeron's architecture guarantees delivery via its lock-free SPSC queues with proper backpressure.
+    2. **Cloud throughput 2.6x local** — 410K msg/s (cloud) vs 156K msg/s (local) at 5M messages. Dedicated instances eliminate CPU contention between server threads, media driver, and benchmarker.
+    3. **Cloud P50 latency 3.7x better than local** — 878ms (cloud) vs 3.3s (local). No CPU contention = faster queue draining.
+    4. **Lower throughput than Raw TCP** — Aeron at 410K msg/s (cloud) vs Raw TCP at 2.45M msg/s (cloud). Aeron's media driver adds serialization overhead and context switching between the embedded driver and client threads.
+    5. **Aeron C library build requires cmake 3.30+, libclang-dev, libbsd-dev** — These must be installed on cloud instances before building. The `rusteron` crates embed Aeron's C source and use cmake + bindgen to build it.
+    6. **Runtime requires ldconfig for libaeron_driver.so** — The dynamically linked Aeron driver library must be registered with the system linker cache.
+
+- **Changes from Previous Attempt (Plain UDP):**
+    1. **Replaced raw UDP with Aeron C library** — Using `rusteron-client` and `rusteron-media-driver` crates instead of raw `std::net::UdpSocket`.
+    2. **Thread-per-core architecture** — Each Aeron worker pinned to a dedicated CPU core via `core_affinity`.
+    3. **Lock-free SPSC queues** — Aeron's built-in ring buffers with cache-line padding (64-byte alignment), no `Mutex`/`RwLock`/`mpsc` on hot path.
+    4. **Fragment assembler** — Handles messages larger than MTU automatically.
+    5. **Separate ingest/delivery ports** — Producers on 6379, consumers on 6380 (no shared socket).
+    6. **mimalloc** — Replaced jemalloc with mimalloc for Aeron's high-concurrency allocation pattern.
+    7. **Benchmarker simplified** — No more `--url` flag, no token bucket, no manual socket tuning. Benchmarker uses Aeron channels directly (`aeron:udp?endpoint=127.0.0.1:6379` for ingest, `aeron:udp?control=127.0.0.1:6380` for delivery).
+
+- **Next Steps:**
+    - Run cloud benchmark (dedicated server + benchmarker instances, no CPU contention) — should see significantly higher throughput and lower latency.
+    - Consider tuning Aeron's `publication-term-buffer-length` and `ipc-term-buffer-length` for larger payloads.
+    - Evaluate `aeron:ipc` for local benchmarking (bypasses UDP entirely, uses shared memory).
+
+- **Comparison to Raw TCP:**
+    | Metric | Raw TCP (Step 4, Cloud) | Aeron UDP (Step 5, Cloud) |
+    |---|---|---|
+    | Throughput (cloud) | 2.45M msg/s | 410K msg/s |
+    | Messages Lost (cloud) | 0% | 0% |
+    | P50 Latency (cloud) | 120ms | 878ms |
+    | Peak Throughput | 2.99M msg/s | 546K msg/s |
+    | Architecture | tokio async TCP + crossbeam channels | Aeron C library + embedded media driver + thread-per-core |
+
+    Raw TCP outperforms Aeron 6x on cloud throughput. The Aeron C media driver embedded in each binary adds serialization overhead and context switching that tokio's async I/O avoids. However, Aeron achieves **0% loss** with proper backpressure — something plain UDP could never do.

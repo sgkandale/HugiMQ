@@ -332,7 +332,9 @@ def main():
 
         common_setup = [
             "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get update",
-            "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get install -y build-essential curl git pkg-config libssl-dev protobuf-compiler",
+            "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get install -y build-essential curl git pkg-config libssl-dev protobuf-compiler uuid-dev python3-pip libclang-dev libbsd-dev",
+            "pip3 install --user cmake",
+            "export PATH=$HOME/.local/bin:$PATH && cmake --version",
             "if ! command -v cargo &> /dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi",
             f"source $HOME/.cargo/env && if [ ! -d 'HugiMQ' ]; then git clone {REPO_URL} HugiMQ; else cd HugiMQ && git pull; fi"
         ]
@@ -348,26 +350,19 @@ def main():
                 "sudo systemctl restart redis-server"
             ]
         elif args.target == "hugimqudp":
-            # Aeron UDP: needs LD_LIBRARY_PATH for libaeron_driver.so
+            # Aeron UDP: needs PATH for pip-installed cmake
             target_setup = common_setup + [
-                "source $HOME/.cargo/env && cd HugiMQ && " + \
-                "AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && " + \
-                "echo \"Aeron lib path: $AERON_LIB\" && " + \
-                "export LD_LIBRARY_PATH=$AERON_LIB:$LD_LIBRARY_PATH && " + \
-                "cargo build --release -p hugimq"
+                "export PATH=$HOME/.local/bin:$PATH && source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p hugimq"
             ]
         else:
             target_setup = common_setup + [
                 "source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p hugimq"
             ]
 
-        # Aeron benchmarker also needs LD_LIBRARY_PATH
+        # Aeron benchmarker also needs PATH for cmake
         if args.target == "hugimqudp":
             bench_setup = common_setup + [
-                "source $HOME/.cargo/env && cd HugiMQ && " + \
-                "AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && " + \
-                "export LD_LIBRARY_PATH=$AERON_LIB:$LD_LIBRARY_PATH && " + \
-                "cargo build --release -p benchmarker"
+                "export PATH=$HOME/.local/bin:$PATH && source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p benchmarker"
             ]
         else:
             bench_setup = common_setup + [
@@ -409,7 +404,7 @@ def main():
             log.info("Starting HugiMQ Aeron UDP server on target instance...")
             run_ssh_commands(target_pub, [
                 "ls -la $HOME/HugiMQ/target/release/hugimq-server",
-                "source $HOME/.cargo/env && AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && export LD_LIBRARY_PATH=$AERON_LIB:$LD_LIBRARY_PATH && (nohup $HOME/HugiMQ/target/release/hugimq-server > $HOME/hugimq.log 2>&1 < /dev/null &)",
+                "AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && sudo ldconfig $AERON_LIB && source $HOME/.cargo/env && (nohup $HOME/HugiMQ/target/release/hugimq-server > $HOME/hugimq.log 2>&1 < /dev/null &)",
                 "sleep 10 && (pgrep hugimq-server || (echo '--- LOG START ---' && cat $HOME/hugimq.log && echo '--- LOG END ---' && exit 1))"
             ], "HUGIMQUDP-START", stop_event)
 
@@ -435,7 +430,7 @@ def main():
 
         if args.target == "hugimqudp":
             benchmark_cmd = [
-                f"source $HOME/.cargo/env && cd HugiMQ && AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && export LD_LIBRARY_PATH=$AERON_LIB:$LD_LIBRARY_PATH && " + \
+                f"AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && sudo ldconfig $AERON_LIB && source $HOME/.cargo/env && cd HugiMQ && " + \
                 f"./target/release/benchmarker " + \
                 f"--connections {args.connections} --messages-per-conn {args.messages} --payload-size {args.payload} " + \
                 f"{url_flag}"
