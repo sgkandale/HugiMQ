@@ -58,6 +58,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     driver_context.set_dir(&server_dir)?;
     // Use DEDICATED threading mode for max performance
     driver_context.set_threading_mode(aeron_threading_mode_enum::AERON_THREADING_MODE_DEDICATED)?;
+    // Large term buffers to reduce context switching during burst traffic
+    std::env::set_var("AERON_TERM_BUFFER_LENGTH", "67108864");  // 64MB
+    std::env::set_var("AERON_IPC_TERM_BUFFER_LENGTH", "67108864");  // 64MB
+    // Increase socket buffer sizes for UDP throughput
+    std::env::set_var("AERON_SOCKET_SO_RCVBUF", "67108864");  // 64MB
+    std::env::set_var("AERON_SOCKET_SO_SNDBUF", "67108864");  // 64MB
     
     let driver = AeronDriver::new(&driver_context)?;
     driver.start(false)?;

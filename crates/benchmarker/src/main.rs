@@ -80,6 +80,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Target: Aeron UDP Multiplexed | Server: {} | Connections: {} | Total: {}", args.server_ip, args.connections, total_expected);
 
     println!("Starting local Aeron media driver...");
+    // Large term buffers to reduce context switching during burst traffic
+    std::env::set_var("AERON_TERM_BUFFER_LENGTH", "67108864");  // 64MB
+    std::env::set_var("AERON_IPC_TERM_BUFFER_LENGTH", "67108864");  // 64MB
+    std::env::set_var("AERON_SOCKET_SO_RCVBUF", "67108864");  // 64MB
+    std::env::set_var("AERON_SOCKET_SO_SNDBUF", "67108864");  // 64MB
+
     let driver_context = AeronDriverContext::new()?;
     let bench_dir_path = "/dev/shm/aeron-benchmarker";
     let bench_dir = CString::new(bench_dir_path).unwrap();
