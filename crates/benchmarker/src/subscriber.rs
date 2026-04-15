@@ -46,6 +46,34 @@ pub async fn run_subscriber(config: SubscriberConfig) -> SubscriberResult {
         }
     }
 
+    let mut buf = [0u8; 4096];
+    let mut acked_topics = Vec::new();
+    let timeout = std::time::Duration::from_millis(100);
+    while acked_topics.len() < config.topics.len() {
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+                let (len, _from_addr) = match result {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let packet = &buf[..len];
+                if let Some((msg_type, _, _, _, _)) = crate::protocol::parse_packet(packet) {
+                    if msg_type == crate::protocol::MSG_ACK_CTRL {
+                        let topic_idx = acked_topics.len() as usize;
+                        if topic_idx < config.topics.len() {
+                            acked_topics.push(config.topics[topic_idx]);
+                            eprintln!("[Subscriber {}] ACK received for topic {}", config.subscriber_id, config.topics[topic_idx]);
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                eprintln!("[Subscriber {}] Timeout waiting for ACKs, proceeding anyway", config.subscriber_id);
+                break;
+            }
+        }
+    }
+
     let mut expected_seq: HashMap<u32, u64> = HashMap::new();
     for &topic_id in &config.topics {
         expected_seq.insert(topic_id, 0);
@@ -58,7 +86,6 @@ pub async fn run_subscriber(config: SubscriberConfig) -> SubscriberResult {
     let mut total_nacks_sent = 0u64;
     let mut total_retransmissions = 0u64;
     let mut messages_lost = 0u64;
-    let mut buf = [0u8; 4096];
 
     let start = std::time::Instant::now();
     let total_expected = config.topics.len() as u64 * config.expected_messages_per_topic;
