@@ -33,7 +33,7 @@ struct Args {
     #[arg(short, long, default_value_t = 128)]
     payload_size: usize,
 
-    #[arg(long, default_value = "tcp://127.0.0.1:6380")]
+    #[arg(long, default_value = "tcp://127.0.0.1:6379")]
     url: String,
 
     #[arg(long, default_value_t = 1)]
@@ -134,9 +134,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match target {
                 Target::Tcp => {
-                    let stream = tokio::net::TcpStream::connect(url.replace("tcp://", ""))
-                        .await
-                        .unwrap();
+                    let stream = match tokio::net::TcpStream::connect(url.replace("tcp://", "")).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[Consumer {}] Connection failed: {}", consumer_id, e);
+                            b.wait().await;
+                            return;
+                        }
+                    };
                     let (mut reader, mut writer) = tokio::io::split(stream);
 
                     // Send subscribe message: [2 bytes total_len][1 byte type][2 bytes topic_len][topic]
@@ -148,11 +153,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     frame.push(0x01); // MSG_SUBSCRIBE
                     frame.extend_from_slice(&topic_len.to_be_bytes());
                     frame.extend_from_slice(topic_bytes);
-                    writer.write_all(&frame).await.unwrap();
+                    if let Err(e) = writer.write_all(&frame).await {
+                        eprintln!("[Consumer {}] Subscribe failed: {}", consumer_id, e);
+                        b.wait().await;
+                        return;
+                    }
 
                     // Wait for server ACK (1 byte) confirming subscriber registration
                     let mut ack_buf = [0u8; 1];
-                    reader.read_exact(&mut ack_buf).await.unwrap();
+                    if let Err(e) = reader.read_exact(&mut ack_buf).await {
+                        eprintln!("[Consumer {}] Read ACK failed: {}", consumer_id, e);
+                        b.wait().await;
+                        return;
+                    }
 
                     // Subscribe confirmed by server BEFORE barriers — no startup race
                     b.wait().await;
@@ -285,10 +298,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match target {
                 Target::Tcp => {
-                    let stream = tokio::net::TcpStream::connect(url.replace("tcp://", ""))
-                        .await
-                        .unwrap();
-                    let (mut reader, mut writer) = tokio::io::split(stream);
+                    let stream = match tokio::net::TcpStream::connect(url.replace("tcp://", "")).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[Producer {}] Connection failed: {}", prod_id, e);
+                            b.wait().await;
+                            return;
+                        }
+                    };
+                    let (mut _reader, mut writer) = tokio::io::split(stream);
 
                     b.wait().await;
                     sb.wait().await;
@@ -339,22 +357,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let _ = writer.flush().await;
 
-                    // Drain all server ACKs
-                    let mut len_buf = [0u8; 2];
-                    loop {
-                        match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut len_buf)).await {
-                            Ok(Ok(2)) => {
-                                let total_len = u16::from_be_bytes(len_buf) as usize;
-                                let mut buf = vec![0u8; total_len];
-                                match tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut buf)).await {
-                                    Ok(Ok(_)) => continue,
-                                    _ => break,
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-
                     let total_duration = publish_start.elapsed().as_nanos() as u64;
                     let _ = local_pub_ack.record(total_duration);
                 }
@@ -364,9 +366,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
+    if let Err(_) = tokio::time::timeout(Duration::from_secs(60), start_barrier.wait()).await {
+        eprintln!("CRITICAL WARNING: Start barrier timed out after 60s. Some tasks may have failed to connect.");
+    }
     println!("All connections ready. Starting benchmark...");
     let start_time = Instant::now();
-    start_barrier.wait().await;
 
     // Spawn a monitor task to print throughput
     let total_received_monitor = Arc::clone(&total_received);

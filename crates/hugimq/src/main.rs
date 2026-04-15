@@ -21,7 +21,7 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity.
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 65536;
 
 /// Read buffer size (64KB)
 const READ_BUF_SIZE: usize = 64 * 1024;
@@ -180,6 +180,7 @@ async fn process_publish_payload(
     let subs = topic.subscribers.load();
 
     // Serial send().await with backpressure — correct for tokio runtime scheduling.
+    // This ensures reliable delivery (no messages lost) even at high throughput.
     let mut dead_indices = Vec::new();
     for (i, sub) in subs.iter().enumerate() {
         if sub.send(message.clone()).await.is_err() {
@@ -289,7 +290,7 @@ async fn main() {
         topics: DashMap::new(),
     });
 
-    let addr: SocketAddr = "0.0.0.0:6380".parse().unwrap();
+    let addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();
     tracing::info!("HugiMQ TCP server listening on {}", addr);
 
     let listener = TcpListener::bind(addr).await.unwrap();
