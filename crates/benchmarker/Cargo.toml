@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-socket2 = { version = "0.5", features = ["all"] }
-hdrhistogram = "7"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive"] }
+hdrhistogram = "7.5"
+bytes = "1.6"
+itoa = "1.0"

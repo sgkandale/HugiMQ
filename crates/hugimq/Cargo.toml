@@ -1,8 +1,21 @@
 [package]
 name = "hugimq"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1.37.0", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+bytes = "1.6.0"
+dashmap = "6.1.0"
+jemallocator = "0.5"
+libc = "0.2"
+arc-swap = "1.7"
+
+[[bin]]
+name = "hugimq-server"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
