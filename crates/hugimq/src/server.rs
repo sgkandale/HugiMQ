@@ -84,7 +84,8 @@ pub async fn run_server(listen_addr: &str) -> Result<(), Box<dyn std::error::Err
                 let topic_id = header.topic_id;
                 let subscriber = Subscriber { addr: remote_addr };
                 state.subscribe(topic_id, subscriber);
-                eprintln!("DEBUG: Subscriber {} subscribed to topic {}", remote_addr, topic_id);
+                eprintln!("DEBUG: Subscriber {} subscribed to topic {} (total subs for topic: {})", 
+                    remote_addr, topic_id, state.get_subscribers(topic_id).len());
 
                 let ack = Packet {
                     header: Header {

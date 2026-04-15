@@ -34,8 +34,12 @@ pub async fn run_subscriber(config: SubscriberConfig) -> SubscriberResult {
         .await
         .expect("Failed to bind subscriber socket");
 
+    println!("[Subscriber {}] Sending SUBSCRIBE packets to {} for topics {:?}", 
+        config.subscriber_id, config.server_addr, config.topics);
+    
     for &topic_id in &config.topics {
         let sub_packet = crate::protocol::build_subscribe_packet(topic_id);
+        eprintln!("[Subscriber {}] Sending SUB for topic {} to {}", config.subscriber_id, topic_id, config.server_addr);
         let _ = socket.send_to(&sub_packet, config.server_addr).await;
     }
 
