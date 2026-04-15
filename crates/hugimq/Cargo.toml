@@ -12,6 +12,8 @@ dashmap = "6.1.0"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 ctrlc = "3.4.4"
+crossbeam-channel = "0.5.12"
+bytes = "1.6.0"
 
 [[bin]]
 name = "hugimq-server"
