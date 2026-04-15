@@ -40,7 +40,10 @@ pub async fn run_subscriber(config: SubscriberConfig) -> SubscriberResult {
     for &topic_id in &config.topics {
         let sub_packet = crate::protocol::build_subscribe_packet(topic_id);
         eprintln!("[Subscriber {}] Sending SUB for topic {} to {}", config.subscriber_id, topic_id, config.server_addr);
-        let _ = socket.send_to(&sub_packet, config.server_addr).await;
+        match socket.send_to(&sub_packet, config.server_addr).await {
+            Ok(n) => eprintln!("[Subscriber {}] Sent {} bytes to server", config.subscriber_id, n),
+            Err(e) => eprintln!("[Subscriber {}] ERROR sending to server: {}", config.subscriber_id, e),
+        }
     }
 
     let mut expected_seq: HashMap<u32, u64> = HashMap::new();
