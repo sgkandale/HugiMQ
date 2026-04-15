@@ -1,1 +1,0 @@
-// HugiMQ library
