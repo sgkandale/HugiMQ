@@ -84,6 +84,7 @@ pub async fn run_server(listen_addr: &str) -> Result<(), Box<dyn std::error::Err
                 let topic_id = header.topic_id;
                 let subscriber = Subscriber { addr: remote_addr };
                 state.subscribe(topic_id, subscriber);
+                eprintln!("DEBUG: Subscriber {} subscribed to topic {}", remote_addr, topic_id);
 
                 let ack = Packet {
                     header: Header {
@@ -117,6 +118,8 @@ pub async fn run_server(listen_addr: &str) -> Result<(), Box<dyn std::error::Err
                 let topic_id = header.topic_id;
 
                 let subscribers = state.get_subscribers(topic_id);
+                eprintln!("DEBUG: Forwarding to {} subscribers for topic {}", subscribers.len(), topic_id);
+
                 let wire_bytes = packet.to_vec();
 
                 for sub in &subscribers {
