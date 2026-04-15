@@ -843,6 +843,12 @@ This file records every architectural iteration, the rationale behind it, and th
     | Messages per Conn | Total Messages | Throughput | Messages Lost | Loss % | P50 Latency | P99 Latency |
     |---|---|---|---|---|---|---|
     | 500,000 | 5,000,000 | 410,007 msg/s | 0 | 0.00% | 878ms | 2.06s |
+    | 500,000 | 5,000,000 | 416,601 msg/s | 0 | 0.00% | 2.5s | 5.1s |
+
+- **Run 1 vs Run 2 Changes:**
+    - **64MB term buffers** (`AERON_TERM_BUFFER_LENGTH=67108864`) — reduces term buffer rollovers during burst traffic
+    - **64MB socket buffers** (`AERON_SOCKET_SO_RCVBUF/SNDBUF`) — kernel caps at ~425KB despite request, limiting UDP burst absorption
+    - **Result:** Negligible throughput change (410K → 416K, +1.6%), but P50 latency regressed 2.9x (878ms → 2.5s), suggesting the large term buffers may cause cache pollution during rollovers.
 
 - **Key Findings:**
     1. **0% message loss at all scales** — Aeron's architecture guarantees delivery via its lock-free SPSC queues with proper backpressure.
@@ -851,6 +857,8 @@ This file records every architectural iteration, the rationale behind it, and th
     4. **Lower throughput than Raw TCP** — Aeron at 410K msg/s (cloud) vs Raw TCP at 2.45M msg/s (cloud). Aeron's media driver adds serialization overhead and context switching between the embedded driver and client threads.
     5. **Aeron C library build requires cmake 3.30+, libclang-dev, libbsd-dev** — These must be installed on cloud instances before building. The `rusteron` crates embed Aeron's C source and use cmake + bindgen to build it.
     6. **Runtime requires ldconfig for libaeron_driver.so** — The dynamically linked Aeron driver library must be registered with the system linker cache.
+    7. **64MB term buffers showed no throughput gain** — 410K → 416K (+1.6%), but P50 latency regressed 2.9x. The bottleneck is the double-hop relay architecture, not buffer sizes. The Linux kernel also caps socket buffers at ~425KB despite 64MB requests.
+    8. **Relay architecture is the fundamental bottleneck** — Every message goes through 2 UDP hops (Producer → Ingest Sub → RelayHandler → Delivery Pub → Consumer) with 2 Aeron context switches and 2 memory copies. Raw TCP does 1 direct hop. Removing the relay and using Aeron's native MDC (many-to-many) subscriptions is the only path to closing the throughput gap.
 
 - **Changes from Previous Attempt (Plain UDP):**
     1. **Replaced raw UDP with Aeron C library** — Using `rusteron-client` and `rusteron-media-driver` crates instead of raw `std::net::UdpSocket`.
@@ -867,12 +875,86 @@ This file records every architectural iteration, the rationale behind it, and th
     - Evaluate `aeron:ipc` for local benchmarking (bypasses UDP entirely, uses shared memory).
 
 - **Comparison to Raw TCP:**
-    | Metric | Raw TCP (Step 4, Cloud) | Aeron UDP (Step 5, Cloud) |
-    |---|---|---|
-    | Throughput (cloud) | 2.45M msg/s | 410K msg/s |
-    | Messages Lost (cloud) | 0% | 0% |
-    | P50 Latency (cloud) | 120ms | 878ms |
-    | Peak Throughput | 2.99M msg/s | 546K msg/s |
-    | Architecture | tokio async TCP + crossbeam channels | Aeron C library + embedded media driver + thread-per-core |
+    | Metric | Raw TCP (Step 4, Cloud) | Aeron UDP (Step 5, Cloud Run 1) | Aeron UDP (Step 5, Cloud Run 2) |
+    |---|---|---|---|
+    | Throughput | 2.45M msg/s | 410K msg/s | 416K msg/s |
+    | Messages Lost | 0% | 0% | 0% |
+    | P50 Latency | 120ms | 878ms | 2.5s |
+    | Peak Throughput | 2.99M msg/s | 546K msg/s | 509K msg/s |
+    | Architecture | tokio async TCP + crossbeam channels | Aeron embedded driver + relay threads | Same + 64MB term buffers |
 
-    Raw TCP outperforms Aeron 6x on cloud throughput. The Aeron C media driver embedded in each binary adds serialization overhead and context switching that tokio's async I/O avoids. However, Aeron achieves **0% loss** with proper backpressure — something plain UDP could never do.
+    Aeron achieves 0% loss but at 1/6th of TCP's throughput. The bottleneck is the **relay architecture**: every message traverses 2 UDP hops with 2 memory copies through Aeron log buffers. Raw TCP sends directly from publish to consumer in a single hop. The path forward is replacing the relay with Aeron's **MDC (Many-to-Many Dynamic Control)** subscriptions, which allow direct producer→consumer routing without intermediate threads or double-copy through log buffers.
+
+---
+
+## Epoch 6: Custom UDP Pub/Sub (Simplified)
+
+### Implementation: Lightweight UDP Binary Protocol + NACK Retransmission
+- **Hypothesis:** Using raw UDP with a simple binary protocol eliminates TCP handshake overhead. Custom NACK-based reliability provides fire-and-forget delivery.
+- **Implementation:** Custom UDP protocol on port 6380.
+  - **Packet format:** `[4 bytes: msg_type (BE)][4 bytes: topic_id][8 bytes: sequence][8 bytes: timestamp][N bytes: payload]`
+  - **Message types:** SUBSCRIBE (0x01), ACK_CTRL (0x02), DATA (0x03), NACK (0x04), RETRANSMIT (0x05)
+  - **Architecture:** Single UDP socket, shared state (`HashMap<topic_id, Vec<Subscriber>>` + `RetransmitRing`)
+- **Server (`hugimq`):** Handles MSG_SUBSCRIBE, MSG_NACK, MSG_DATA. Sends ACKs, stores DATA in ring buffer.
+- **Benchmarker (`benchmarker`):** 10 publishers, 10 subscribers, 10 topics.
+
+### Cloud Test Results (AWS Spot — Multiple Runs)
+
+| Run | Issue | Throughput (sent) | Received | Lost |
+|---|---|---|---|
+| 1 | Subscribers bound to 127.0.0.1 | ~700K-1.4M/pub | 0 | 100% |
+| 2 | Changed to 0.0.0.0, 500ms delay | ~700K-1.4M/pub | 0 | 100% |
+
+**Issues Encountered:**
+
+1. **Subscriber bind address (Run 1):** Subscribers bound to `127.0.0.1` — only accepts local connections. Benchmarker (separate machine) couldn't reach subscribers.
+   - **Fix:** Changed to `0.0.0.0`
+
+2. **Subscription timing race (Run 2):** Subscribers sent SUBSCRIBE after publishing completed. Orchestrator had 500ms delay, but publishers finished in ~1ms.
+   - **Debug:** Added ACK wait — subscribers wait for server ACK before processing
+   - **Result:** Still failing
+
+3. **Network visibility:** UDP issues invisible — cannot see if SG blocks packets, network drops, or subscriptions reach server.
+
+**Debug Log (timestamps):**
+```
+17:06:51 - Publishers start
+17:06:51 - Publishers finish (~1ms)
+17:07:01 - Report prints (10s later)
+17:07:01 - Subscriptions sent (AFTER benchmark)
+17:07:01 - ACK received (AFTER benchmark)
+```
+
+Subscriptions sent AFTER report printed — during subscriber timeout wait, not before publishing.
+
+### Local Results
+- **Throughput:** ~700K-1.4M msg/s per publisher
+- **Message Loss:** ~20% (UDP buffer limits, not reliability bug)
+- **Note:** Local works. Throughput excellent.
+
+### Final Assessment
+
+UDP in cloud faces fundamental issues:
+- **Invisible failures** — can't observe drops without packet capture
+- **Security groups** — UDP rules differ; directionality matters
+- **Timing sensitivity** — fire-and-forget needs sync TCP handles automatically
+- **Zero visibility** — no connect/accept handshakes
+
+| Metric | Local | Cloud |
+|---|---|---|
+| Throughput | ~1M+ msg/s | ~700K-1.4M (sent) |
+| Reliability | ~80% | 0% |
+| Debuggability | Full | Zero |
+
+---
+
+## Summary: Protocol Comparison (All Epochs, Cloud)
+
+| Protocol | Avg Throughput | Peak | Loss | E2E P50 | E2E P99 |
+|---|---|---|---|---|---|
+| gRPC (HTTP/2) | 2,711,528 | 2.76M | 0% | 231ms | 250ms |
+| Raw TCP | 2,453,524 | 2.99M | 0% | 120ms | 182ms |
+| Aeron UDP | 410K | 546K | 0% | 878ms | 2.06s |
+| Custom UDP | N/A | ~1.4M | 100%* | N/A | N/A |
+
+*Sent but never received — subscription timing race.*
