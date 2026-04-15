@@ -30,7 +30,7 @@ pub struct SubscriberResult {
 }
 
 pub async fn run_subscriber(config: SubscriberConfig) -> SubscriberResult {
-    let socket = UdpSocket::bind(format!("127.0.0.1:{}", config.listen_port))
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", config.listen_port))
         .await
         .expect("Failed to bind subscriber socket");
 
