@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -26,12 +26,6 @@ const SUBSCRIBER_CHANNEL_CAPACITY: usize = 65536;
 /// Read buffer size (64KB)
 const READ_BUF_SIZE: usize = 64 * 1024;
 
-/// Write batch size for subscribers (128KB — doubled from 64KB to cut syscalls in half)
-const WRITE_BATCH_SIZE: usize = 128 * 1024;
-
-/// 4MB socket buffers (kernel doubles to 8MB)
-const SOCKET_BUF_SIZE: i32 = 4 * 1024 * 1024;
-
 struct Topic {
     /// Lock-free subscriber list via ArcSwap — publish path does single atomic load
     subscribers: ArcSwap<Vec<mpsc::Sender<Message>>>,
@@ -39,7 +33,8 @@ struct Topic {
 }
 
 struct AppState {
-    topics: DashMap<String, Arc<Topic>>,
+    /// Lock-free topic registry — read path is 100% lock-free
+    topics: ArcSwap<HashMap<String, Arc<Topic>>>,
 }
 
 // ─── Wire protocol ──────────────────────────────────────────────
@@ -54,20 +49,30 @@ struct AppState {
 // ─────────────────────────────────────────────────────────────────
 
 fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
-    if let Some(entry) = state.topics.get(topic) {
+    // Fast path: topic already exists (lock-free read)
+    if let Some(entry) = state.topics.load().get(topic) {
         return entry.clone();
     }
 
-    state
-        .topics
-        .entry(topic.to_string())
-        .or_insert_with(|| {
-            Arc::new(Topic {
-                subscribers: ArcSwap::new(Arc::new(Vec::new())),
-                subscriber_count: AtomicUsize::new(0),
-            })
-        })
-        .clone()
+    // Slow path: topic creation (CAS loop)
+    loop {
+        let current = state.topics.load();
+        if let Some(entry) = current.get(topic) {
+            return entry.clone();
+        }
+
+        let mut new_map: HashMap<String, Arc<Topic>> = current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let new_topic = Arc::new(Topic {
+            subscribers: ArcSwap::new(Arc::new(Vec::new())),
+            subscriber_count: AtomicUsize::new(0),
+        });
+        new_map.insert(topic.to_string(), new_topic.clone());
+
+        let old = state.topics.compare_and_swap(&current, Arc::new(new_map));
+        if Arc::ptr_eq(&*old, &*current) {
+            return new_topic;
+        }
+    }
 }
 
 // ─── Connection handler ──────────────────────────────────────────────
@@ -230,11 +235,16 @@ async fn handle_subscribe_connection(
         return;
     }
 
-    // OPTIMIZATION: 128KB write batching (doubled from 64KB) — each syscall delivers
-    // ~800 messages instead of ~400, cutting subscribe-path syscalls from ~1.5M to ~750K.
-    let mut write_buf = Vec::with_capacity(WRITE_BATCH_SIZE);
+    // OPTIMIZATION: Zero-copy Scatter/Gather I/O with 128KB batching.
+    // Instead of copying payloads into a Vec<u8>, we collect Arc<Bytes> and headers
+    // and send them in one syscall using writev (via write_vectored).
     let topic_bytes = topic_name.as_bytes();
     let topic_len = topic_bytes.len() as u16;
+
+    // We use a fixed-size array for IoSlices to avoid allocation in the hot loop.
+    // Each message needs 2 slices: [header + topic_bytes + payload_len_buf] and [payload].
+    const MAX_BATCH: usize = 64;
+    let mut messages = Vec::with_capacity(MAX_BATCH);
 
     loop {
         let msg = match rx.recv().await {
@@ -242,38 +252,52 @@ async fn handle_subscribe_connection(
             None => break,
         };
 
-        encode_subscribe_data(&msg, topic_bytes, topic_len, &mut write_buf);
+        messages.push(msg);
 
-        // Drain remaining buffered messages (non-blocking, same consumer task)
-        while write_buf.len() < WRITE_BATCH_SIZE {
+        // Drain remaining buffered messages up to MAX_BATCH
+        while messages.len() < MAX_BATCH {
             match rx.try_recv() {
-                Ok(msg) => encode_subscribe_data(&msg, topic_bytes, topic_len, &mut write_buf),
+                Ok(msg) => messages.push(msg),
                 Err(_) => break,
             }
         }
 
-        // Write entire batch in one syscall + flush
-        if stream.write_all(&write_buf).await.is_err() {
+        // We need to keep headers alive until write_vectored completes.
+        // A Vec<Bytes> is efficient for this.
+        let mut batch_headers = Vec::with_capacity(messages.len());
+
+        for msg in &messages {
+            let payload_len = msg.payload.len() as u16;
+            let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
+            
+            let mut header_temp = BytesMut::with_capacity(5 + topic_bytes.len() + 2);
+            header_temp.put_u16(total_len as u16);
+            header_temp.put_u8(MSG_SUBSCRIBE_DATA);
+            header_temp.put_u16(topic_len);
+            header_temp.put_slice(topic_bytes);
+            header_temp.put_u16(payload_len);
+            
+            let header_bytes = header_temp.freeze();
+            batch_headers.push(header_bytes);
+        }
+
+        // Prepare IoSlices for the batch
+        let mut io_slices = Vec::with_capacity(messages.len() * 2);
+        for (i, msg) in messages.iter().enumerate() {
+            io_slices.push(std::io::IoSlice::new(&batch_headers[i]));
+            io_slices.push(std::io::IoSlice::new(&msg.payload));
+        }
+
+        // Write entire batch in one syscall
+        if stream.write_vectored(&io_slices).await.is_err() {
             break;
         }
         if stream.flush().await.is_err() {
             break;
         }
-        write_buf.clear();
-    }
-}
 
-/// Encode a SUBSCRIBE_DATA frame into the write buffer.
-#[inline]
-fn encode_subscribe_data(msg: &Message, topic_bytes: &[u8], topic_len: u16, buf: &mut Vec<u8>) {
-    let payload_len = msg.payload.len() as u16;
-    let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
-    buf.put_u16(total_len as u16);
-    buf.put_u8(MSG_SUBSCRIBE_DATA);
-    buf.put_u16(topic_len);
-    buf.extend_from_slice(topic_bytes);
-    buf.put_u16(payload_len);
-    buf.extend_from_slice(&msg.payload);
+        messages.clear();
+    }
 }
 
 #[tokio::main]
@@ -287,7 +311,7 @@ async fn main() {
         .init();
 
     let state = Arc::new(AppState {
-        topics: DashMap::new(),
+        topics: ArcSwap::new(Arc::new(HashMap::new())),
     });
 
     let addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();

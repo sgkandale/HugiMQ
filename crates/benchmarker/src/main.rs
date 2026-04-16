@@ -33,7 +33,7 @@ struct Args {
     #[arg(short, long, default_value_t = 128)]
     payload_size: usize,
 
-    #[arg(long, default_value = "tcp://127.0.0.1:6379")]
+    #[arg(short, long, default_value = "tcp://127.0.0.1:6379")]
     url: String,
 
     #[arg(long, default_value_t = 1)]
