@@ -171,100 +171,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     b.wait().await;
                     sb.wait().await;
 
-                    // Read loop: buffered read — parse multiple frames from one 64KB read syscall
-                    // instead of two read_exact() calls per message.
                     let mut read_buf = BytesMut::with_capacity(READ_BUF_SIZE);
                     let mut read_bytes = [0u8; READ_BUF_SIZE];
 
-                    while received_by_this_consumer < expected_for_this_consumer {
-                        // Ensure we have at least 3 bytes (header)
-                        while read_buf.len() < 3 {
-                            let n = match tokio::time::timeout(
-                                Duration::from_secs(5),
-                                reader.read(&mut read_bytes),
-                            ).await {
-                                Ok(Ok(n)) if n > 0 => n,
-                                _ => break,
-                            };
-                            read_buf.extend_from_slice(&read_bytes[..n]);
-                        }
+                    loop {
+                        // 1. Process all COMPLETE frames already in the buffer
+                        while read_buf.len() >= 3 {
+                            let total_len = u16::from_be_bytes([read_buf[0], read_buf[1]]) as usize;
+                            let frame_len = 2 + total_len;
 
-                        if read_buf.len() < 3 {
-                            break; // timeout or EOF
-                        }
+                            if read_buf.len() < frame_len {
+                                break;
+                            }
 
-                        let total_len = u16::from_be_bytes([read_buf[0], read_buf[1]]) as usize;
-                        let frame_len = 2 + total_len;
-
-                        // If we don't have the full frame, read more
-                        while read_buf.len() < frame_len {
-                            let remaining = frame_len - read_buf.len();
-                            let to_read = remaining.min(read_bytes.len());
-                            let n = match tokio::time::timeout(
-                                Duration::from_secs(5),
-                                reader.read(&mut read_bytes[..to_read]),
-                            ).await {
-                                Ok(Ok(n)) if n > 0 => n,
-                                _ => break,
-                            };
-                            read_buf.extend_from_slice(&read_bytes[..n]);
-                        }
-
-                        if read_buf.len() < frame_len {
-                            break; // timeout
-                        }
-
-                        let msg_type = read_buf[2];
-                        if msg_type == 0x03 { // MSG_SUBSCRIBE_DATA
-                            let payload_data = &read_buf[3..frame_len];
-                            if payload_data.len() >= 4 {
-                                let t_len = u16::from_be_bytes([payload_data[0], payload_data[1]]) as usize;
-                                if payload_data.len() >= 2 + t_len + 2 {
-                                    // Topic validation (still needed)
-                                    if &payload_data[2..2 + t_len] != topic_name.as_bytes() {
-                                        let received_topic = String::from_utf8_lossy(&payload_data[2..2 + t_len]);
-                                        eprintln!("CRITICAL ERROR: Received message for topic '{}' on consumer subscribed to '{}'", received_topic, topic_name);
-                                        std::process::exit(1);
-                                    }
+                            let msg_type = read_buf[2];
+                            if msg_type == 0x03 { // MSG_SUBSCRIBE_DATA
+                                let payload_data = &read_buf[3..frame_len];
+                                if payload_data.len() >= 4 {
+                                    let t_len = u16::from_be_bytes([payload_data[0], payload_data[1]]) as usize;
                                     
-                                    let p_offset = 2 + t_len + 2;
-                                    let payload_bytes = &payload_data[p_offset..];
-                                    
-                                    // OPTIMIZATION: Fast manual byte scanner for timestamp parsing
-                                    // Format: prod_id:seq:now:topic_name:payload
-                                    let mut colons_found = 0;
-                                    let mut timestamp_start = 0;
-                                    let mut timestamp_end = 0;
-                                    for (i, &b) in payload_bytes.iter().enumerate() {
-                                        if b == b':' {
-                                            colons_found += 1;
-                                            if colons_found == 2 {
-                                                timestamp_start = i + 1;
-                                            } else if colons_found == 3 {
-                                                timestamp_end = i;
-                                                break;
+                                    if received_by_this_consumer % 100 == 0 && payload_data.len() >= 2 + t_len + 2 {
+                                        let p_offset = 2 + t_len + 2;
+                                        let payload_bytes = &payload_data[p_offset..];
+                                        
+                                        let mut colons_found = 0;
+                                        let mut timestamp_start = 0;
+                                        let mut timestamp_end = 0;
+                                        for (i, &b) in payload_bytes.iter().enumerate() {
+                                            if b == b':' {
+                                                colons_found += 1;
+                                                if colons_found == 2 {
+                                                    timestamp_start = i + 1;
+                                                } else if colons_found == 3 {
+                                                    timestamp_end = i;
+                                                    break;
+                                                }
                                             }
                                         }
-                                    }
 
-                                    if timestamp_end > timestamp_start {
-                                        let ts_bytes = &payload_bytes[timestamp_start..timestamp_end];
-                                        let mut ts_val = 0u128;
-                                        for &b in ts_bytes {
-                                            ts_val = ts_val * 10 + (b - b'0') as u128;
+                                        if timestamp_end > timestamp_start {
+                                            let ts_bytes = &payload_bytes[timestamp_start..timestamp_end];
+                                            let mut ts_val = 0u128;
+                                            for &b in ts_bytes {
+                                                ts_val = ts_val * 10 + (b - b'0') as u128;
+                                            }
+                                            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+                                            let latency = (now.saturating_sub(ts_val)) as u64;
+                                            let _ = local_e2e.record(latency);
                                         }
-                                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-                                        let latency = (now.saturating_sub(ts_val)) as u64;
-                                        let _ = local_e2e.record(latency);
                                     }
 
                                     total_received.fetch_add(1, Ordering::Relaxed);
                                     received_by_this_consumer += 1;
                                 }
                             }
+                            read_buf.advance(frame_len);
+                            
+                            // Exit if we've received everything
+                            if received_by_this_consumer >= expected_for_this_consumer {
+                                break;
+                            }
                         }
 
-                        read_buf.advance(frame_len);
+                        if received_by_this_consumer >= expected_for_this_consumer {
+                            break;
+                        }
+
+                        // 2. Read more data from the socket
+                        let n = match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            reader.read(&mut read_bytes),
+                        ).await {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => {
+                                if received_by_this_consumer < expected_for_this_consumer {
+                                    eprintln!("[Consumer {}] Unexpected EOF/Timeout: Got {}/{}", consumer_id, received_by_this_consumer, expected_for_this_consumer);
+                                }
+                                break;
+                            }
+                        };
+                        read_buf.extend_from_slice(&read_bytes[..n]);
                     }
                 }
             }
@@ -313,15 +299,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let publish_start = Instant::now();
                     let mut write_buf = Vec::with_capacity(WRITE_BATCH_SIZE);
+                    let mut msg_header = Vec::with_capacity(128);
+                    let mut itoa_buf = itoa::Buffer::new();
 
                     for seq in 0..msg_count {
-                        let topic_name = &my_topics[seq % my_topics.len()];
+                        let topic_idx = seq % my_topics.len();
+                        let topic_name = &my_topics[topic_idx];
                         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
                         
-                        // OPTIMIZATION: Avoid format! and use itoa for fast byte writing
-                        let mut msg_header = Vec::with_capacity(64);
-                        let mut itoa_buf = itoa::Buffer::new();
-                        
+                        msg_header.clear();
                         msg_header.extend_from_slice(itoa_buf.format(prod_id).as_bytes());
                         msg_header.push(b':');
                         msg_header.extend_from_slice(itoa_buf.format(seq).as_bytes());

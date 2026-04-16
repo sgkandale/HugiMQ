@@ -20,16 +20,19 @@ struct Message {
     payload: Arc<Bytes>,
 }
 
-/// Per-subscriber bounded channel capacity.
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 65536;
+/// Per-subscriber bounded channel capacity (in batches).
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
 
 /// Read buffer size (64KB)
 const READ_BUF_SIZE: usize = 64 * 1024;
 
+#[repr(align(64))]
 struct Topic {
     /// Lock-free subscriber list via ArcSwap — publish path does single atomic load
-    subscribers: ArcSwap<Vec<mpsc::Sender<Message>>>,
+    /// Now sends pre-encoded Bytes batches for maximum efficiency.
+    subscribers: ArcSwap<Vec<mpsc::Sender<Arc<Bytes>>>>,
     subscriber_count: AtomicUsize,
+    name: String,
 }
 
 struct AppState {
@@ -65,6 +68,7 @@ fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
         let new_topic = Arc::new(Topic {
             subscribers: ArcSwap::new(Arc::new(Vec::new())),
             subscriber_count: AtomicUsize::new(0),
+            name: topic.to_string(),
         });
         new_map.insert(topic.to_string(), new_topic.clone());
 
@@ -119,16 +123,22 @@ async fn handle_publish_connection(
 ) {
     let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
     let mut stream = stream;
+    let mut pending_batch: Vec<(Arc<Topic>, Message)> = Vec::with_capacity(512);
+    const BATCH_SIZE: usize = 512;
+    let mut fanout_tasks = tokio::task::JoinSet::new();
 
-    // Process the first frame (still using a slice for compatibility with current structure)
-    process_publish_payload(Bytes::copy_from_slice(first_payload), &mut cache, &state).await;
+    if let Some((topic, msg)) = parse_and_create_message(Bytes::copy_from_slice(first_payload), &mut cache, &state) {
+        pending_batch.push((topic, msg));
+    }
+
+    if pending_batch.len() >= BATCH_SIZE {
+        flush_message_batch(&mut pending_batch, &mut fanout_tasks).await;
+    }
 
     let mut read_buf = BytesMut::with_capacity(READ_BUF_SIZE);
     loop {
-        if stream.read_buf(&mut read_buf).await.is_err() {
-            break;
-        }
-
+        let n = stream.read_buf(&mut read_buf).await.unwrap_or(0);
+        
         while read_buf.len() >= 3 {
             let total_len = u16::from_be_bytes([read_buf[0], read_buf[1]]) as usize;
             let frame_len = 2 + total_len;
@@ -138,70 +148,153 @@ async fn handle_publish_connection(
             }
 
             let mut frame = read_buf.split_to(frame_len);
-            frame.advance(2); // Consume len_buf
+            frame.advance(2);
 
             if frame[0] == MSG_PUBLISH {
-                let msg_frame = frame.split_off(1); // Extract payload after msg_type
-                process_publish_payload(msg_frame.freeze(), &mut cache, &state).await;
+                let msg_frame = frame.split_off(1);
+                if let Some((topic, msg)) = parse_and_create_message(msg_frame.freeze(), &mut cache, &state) {
+                    pending_batch.push((topic, msg));
+                    if pending_batch.len() >= BATCH_SIZE {
+                        flush_message_batch(&mut pending_batch, &mut fanout_tasks).await;
+                    }
+                }
             }
+        }
+
+        if n == 0 {
+            break;
+        }
+    }
+
+    if !pending_batch.is_empty() {
+        flush_message_batch(&mut pending_batch, &mut fanout_tasks).await;
+    }
+
+    // Crucially, we MUST await all spawned fan-out tasks to ensure the messages
+    // reach the subscriber channels before this producer handler exits.
+    while let Some(res) = fanout_tasks.join_next().await {
+        if let Err(e) = res {
+            tracing::error!("Fan-out task panicked: {}", e);
         }
     }
 }
 
-async fn process_publish_payload(
+fn parse_and_create_message(
     payload: Bytes,
     cache: &mut Vec<(String, Arc<Topic>)>,
     state: &Arc<AppState>,
-) {
+) -> Option<(Arc<Topic>, Message)> {
     if payload.len() < 2 {
-        return;
+        return None;
     }
     let topic_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
     if payload.len() < 2 + topic_len {
-        return;
+        return None;
     }
-    let topic_name = String::from_utf8_lossy(&payload[2..2 + topic_len]);
+    let topic_name = String::from_utf8_lossy(&payload[2..2 + topic_len]).into_owned();
 
-    let topic = if let Some(found) = cache.iter().find(|(name, _)| name == topic_name.as_ref()) {
+    let topic = if let Some(found) = cache.iter().find(|(name, _)| name == &topic_name) {
         found.1.clone()
     } else {
-        let topic = get_or_create_topic(state, topic_name.as_ref());
+        let topic = get_or_create_topic(state, &topic_name);
         if cache.len() >= 4 {
             cache.remove(0);
         }
-        cache.push((topic_name.into_owned(), topic.clone()));
+        cache.push((topic_name.clone(), topic.clone()));
         topic
     };
 
-    // OPTIMIZATION: Zero-copy slicing of the incoming Bytes buffer.
-    // The payload after the topic is identified.
     let payload_data = payload.slice(2 + topic_len..);
     let message = Message {
         payload: Arc::new(payload_data),
     };
 
-    // OPTIMIZATION: Lock-free subscriber list via ArcSwap — single atomic load,
-    // no futex syscall (RwLock::read() acquires a mutex even under no contention).
-    let subs = topic.subscribers.load();
+    Some((topic, message))
+}
 
-    // Serial send().await with backpressure — correct for tokio runtime scheduling.
-    // This ensures reliable delivery (no messages lost) even at high throughput.
-    let mut dead_indices = Vec::new();
-    for (i, sub) in subs.iter().enumerate() {
-        if sub.send(message.clone()).await.is_err() {
-            dead_indices.push(i);
+async fn flush_message_batch(batch: &mut Vec<(Arc<Topic>, Message)>, fanout_tasks: &mut tokio::task::JoinSet<()>) {
+    if batch.is_empty() {
+        return;
+    }
+
+    let mut groups: Vec<(Arc<Topic>, Vec<Message>)> = Vec::new();
+    for (topic, msg) in batch.drain(..) {
+        // Fast path: check if it belongs to the last group (common in 1-topic benchmarks)
+        if let Some(last) = groups.last_mut() {
+            if Arc::ptr_eq(&last.0, &topic) {
+                last.1.push(msg);
+                continue;
+            }
+        }
+        
+        // Slow path: find existing group
+        if let Some(existing) = groups.iter_mut().find(|(t, _)| Arc::ptr_eq(&t, &topic)) {
+            existing.1.push(msg);
+        } else {
+            groups.push((topic, vec![msg]));
         }
     }
 
-    if !dead_indices.is_empty() {
-        let count = dead_indices.len();
-        // ArcSwap: build a new Vec, swap atomically — no write-lock needed
-        let mut new_subs: Vec<_> = subs.iter().cloned().collect();
-        for i in dead_indices.into_iter().rev() {
-            new_subs.remove(i);
+    for (topic, messages) in groups {
+        let subs = topic.subscribers.load().clone();
+        let topic_clone = topic.clone();
+        
+        fanout_tasks.spawn(async move {
+            // Encode ONCE per topic
+            let mut encoded_batch = BytesMut::with_capacity(messages.len() * 150);
+            let topic_bytes = topic_clone.name.as_bytes();
+            let topic_len = topic_bytes.len() as u16;
+
+            for msg in messages {
+                let payload_len = msg.payload.len() as u16;
+                let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
+
+                encoded_batch.put_u16(total_len as u16);
+                encoded_batch.put_u8(MSG_SUBSCRIBE_DATA);
+                encoded_batch.put_u16(topic_len);
+                encoded_batch.put_slice(topic_bytes);
+                encoded_batch.put_u16(payload_len);
+                encoded_batch.put_slice(&msg.payload);
+            }
+            
+            let final_batch = Arc::new(encoded_batch.freeze());
+            let dead_count = broadcast_to_subscribers(&subs, final_batch).await;
+            
+            if dead_count > 0 {
+                remove_dead_subscribers(&topic_clone, &subs, dead_count).await;
+            }
+        });
+    }
+}
+
+async fn broadcast_to_subscribers(subs: &Vec<mpsc::Sender<Arc<Bytes>>>, batch: Arc<Bytes>) -> usize {
+    let mut dead_count = 0;
+    for sub in subs.iter() {
+        if sub.send(batch.clone()).await.is_err() {
+            dead_count += 1;
         }
-        topic.subscribers.store(Arc::new(new_subs));
-        topic.subscriber_count.fetch_sub(count, Ordering::Relaxed);
+    }
+    dead_count
+}
+
+async fn remove_dead_subscribers(topic: &Arc<Topic>, subs_snapshot: &Vec<mpsc::Sender<Arc<Bytes>>>, dead_count: usize) {
+    if dead_count == 0 { return; }
+    
+    // Use a CAS loop to ensures we don't overwrite other concurrent subscriber changes
+    loop {
+        let current = topic.subscribers.load();
+        // Remove any senders that are closed. We check the current list, not the snapshot.
+        let new_subs: Vec<_> = current.iter().cloned().filter(|s| !s.is_closed()).collect();
+        let removed_this_time = current.len().saturating_sub(new_subs.len());
+        
+        let new_arc = Arc::new(new_subs);
+        let old = topic.subscribers.compare_and_swap(&current, new_arc);
+        if Arc::ptr_eq(&*old, &*current) {
+            if removed_this_time > 0 {
+                topic.subscriber_count.fetch_sub(removed_this_time, Ordering::Relaxed);
+            }
+            break;
+        }
     }
 }
 
@@ -235,68 +328,22 @@ async fn handle_subscribe_connection(
         return;
     }
 
-    // OPTIMIZATION: Zero-copy Scatter/Gather I/O with 128KB batching.
-    // Instead of copying payloads into a Vec<u8>, we collect Arc<Bytes> and headers
-    // and send them in one syscall using writev (via write_vectored).
-    let topic_bytes = topic_name.as_bytes();
-    let topic_len = topic_bytes.len() as u16;
-
-    // We use a fixed-size array for IoSlices to avoid allocation in the hot loop.
-    // Each message needs 2 slices: [header + topic_bytes + payload_len_buf] and [payload].
-    const MAX_BATCH: usize = 64;
-    let mut messages = Vec::with_capacity(MAX_BATCH);
-
     loop {
-        let msg = match rx.recv().await {
-            Some(msg) => msg,
+        let encoded_batch = match rx.recv().await {
+            Some(batch) => batch,
             None => break,
         };
 
-        messages.push(msg);
-
-        // Drain remaining buffered messages up to MAX_BATCH
-        while messages.len() < MAX_BATCH {
-            match rx.try_recv() {
-                Ok(msg) => messages.push(msg),
-                Err(_) => break,
+        if stream.write_all(&encoded_batch).await.is_err() {
+            break;
+        }
+        
+        // Only flush if no more batches are pending in the channel
+        if rx.is_empty() {
+            if stream.flush().await.is_err() {
+                break;
             }
         }
-
-        // We need to keep headers alive until write_vectored completes.
-        // A Vec<Bytes> is efficient for this.
-        let mut batch_headers = Vec::with_capacity(messages.len());
-
-        for msg in &messages {
-            let payload_len = msg.payload.len() as u16;
-            let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
-            
-            let mut header_temp = BytesMut::with_capacity(5 + topic_bytes.len() + 2);
-            header_temp.put_u16(total_len as u16);
-            header_temp.put_u8(MSG_SUBSCRIBE_DATA);
-            header_temp.put_u16(topic_len);
-            header_temp.put_slice(topic_bytes);
-            header_temp.put_u16(payload_len);
-            
-            let header_bytes = header_temp.freeze();
-            batch_headers.push(header_bytes);
-        }
-
-        // Prepare IoSlices for the batch
-        let mut io_slices = Vec::with_capacity(messages.len() * 2);
-        for (i, msg) in messages.iter().enumerate() {
-            io_slices.push(std::io::IoSlice::new(&batch_headers[i]));
-            io_slices.push(std::io::IoSlice::new(&msg.payload));
-        }
-
-        // Write entire batch in one syscall
-        if stream.write_vectored(&io_slices).await.is_err() {
-            break;
-        }
-        if stream.flush().await.is_err() {
-            break;
-        }
-
-        messages.clear();
     }
 }
 
@@ -310,12 +357,13 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let port = std::env::args().nth(1).unwrap_or_else(|| "6379".to_string());
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+    tracing::info!("HugiMQ TCP server listening on {}", addr);
+
     let state = Arc::new(AppState {
         topics: ArcSwap::new(Arc::new(HashMap::new())),
     });
-
-    let addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();
-    tracing::info!("HugiMQ TCP server listening on {}", addr);
 
     let listener = TcpListener::bind(addr).await.unwrap();
     loop {
