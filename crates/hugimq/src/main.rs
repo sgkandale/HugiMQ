@@ -21,7 +21,8 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity (in batches).
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 16384;
+/// Set to 64 to cap memory usage per subscriber to ~80MB (64 batches * 128 messages * 10KB).
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
 
 /// Read buffer size (64KB)
 const READ_BUF_SIZE: usize = 64 * 1024;
