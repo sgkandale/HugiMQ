@@ -9,3 +9,5 @@ clap = { version = "4.4", features = ["derive"] }
 hdrhistogram = "7.5"
 bytes = "1.6"
 itoa = "1.0"
+redis = { version = "0.24", features = ["tokio-comp"] }
+futures-util = "0.3"
