@@ -34,6 +34,8 @@ struct Topic {
     subscribers: ArcSwap<Vec<mpsc::Sender<Arc<Bytes>>>>,
     subscriber_count: AtomicUsize,
     name: String,
+    /// Channel to send message batches to the persistent topic worker task.
+    worker_tx: mpsc::Sender<Vec<Message>>,
 }
 
 struct AppState {
@@ -52,6 +54,9 @@ struct AppState {
 // SUBSCRIBE_DATA: [1 byte: 0x03][2 bytes: topic_len][topic][2 bytes: payload_len][message payload]
 // ─────────────────────────────────────────────────────────────────
 
+/// Capacity for the topic worker's batch channel.
+const TOPIC_WORKER_CHANNEL_CAPACITY: usize = 1024;
+
 fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
     // Fast path: topic already exists (lock-free read)
     if let Some(entry) = state.topics.load().get(topic) {
@@ -66,16 +71,60 @@ fn get_or_create_topic(state: &Arc<AppState>, topic: &str) -> Arc<Topic> {
         }
 
         let mut new_map: HashMap<String, Arc<Topic>> = current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        
+        // Create worker channel and topic
+        let (worker_tx, worker_rx) = mpsc::channel(TOPIC_WORKER_CHANNEL_CAPACITY);
         let new_topic = Arc::new(Topic {
             subscribers: ArcSwap::new(Arc::new(Vec::new())),
             subscriber_count: AtomicUsize::new(0),
             name: topic.to_string(),
+            worker_tx,
         });
+        
+        // Spawn the persistent worker task
+        let topic_clone = new_topic.clone();
+        tokio::spawn(async move {
+            topic_worker_loop(topic_clone, worker_rx).await;
+        });
+
         new_map.insert(topic.to_string(), new_topic.clone());
 
         let old = state.topics.compare_and_swap(&current, Arc::new(new_map));
         if Arc::ptr_eq(&*old, &*current) {
             return new_topic;
+        }
+    }
+}
+
+async fn topic_worker_loop(topic: Arc<Topic>, mut rx: mpsc::Receiver<Vec<Message>>) {
+    while let Some(messages) = rx.recv().await {
+        let subs = topic.subscribers.load();
+        if subs.is_empty() {
+            continue;
+        }
+
+        // Encode ONCE per topic. Estimate 10KB per message for variable payloads to avoid reallocs.
+        let mut encoded_batch = BytesMut::with_capacity(messages.len() * 10240);
+        let topic_bytes = topic.name.as_bytes();
+        let topic_len = topic_bytes.len() as u16;
+
+        for msg in messages {
+            let payload_len = msg.payload.len() as u16;
+            let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
+
+            encoded_batch.put_u16(total_len as u16);
+            encoded_batch.put_u8(MSG_SUBSCRIBE_DATA);
+            encoded_batch.put_u16(topic_len);
+            encoded_batch.put_slice(topic_bytes);
+            encoded_batch.put_u16(payload_len);
+            encoded_batch.put_slice(&msg.payload);
+        }
+        
+        let final_batch = Arc::new(encoded_batch.freeze());
+        let dead_count = broadcast_to_subscribers(&subs, final_batch).await;
+        
+        if dead_count > 0 {
+            remove_dead_subscribers(&topic, &subs, dead_count).await;
         }
     }
 }
@@ -124,16 +173,11 @@ async fn handle_publish_connection(
 ) {
     let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
     let mut stream = stream;
-    let mut pending_batch: Vec<(Arc<Topic>, Message)> = Vec::with_capacity(128);
+    let mut pending_batch: Vec<(Arc<Topic>, Vec<Message>)> = Vec::with_capacity(4);
     const BATCH_SIZE: usize = 128;
-    let mut fanout_tasks = tokio::task::JoinSet::new();
 
     if let Some((topic, msg)) = parse_and_create_message(Bytes::copy_from_slice(first_payload), &mut cache, &state) {
-        pending_batch.push((topic, msg));
-    }
-
-    if pending_batch.len() >= BATCH_SIZE {
-        flush_message_batch(&mut pending_batch, &mut fanout_tasks).await;
+        pending_batch.push((topic, vec![msg]));
     }
 
     let mut read_buf = BytesMut::with_capacity(READ_BUF_SIZE);
@@ -154,9 +198,14 @@ async fn handle_publish_connection(
             if frame[0] == MSG_PUBLISH {
                 let msg_frame = frame.split_off(1);
                 if let Some((topic, msg)) = parse_and_create_message(msg_frame.freeze(), &mut cache, &state) {
-                    pending_batch.push((topic, msg));
-                    if pending_batch.len() >= BATCH_SIZE {
-                        flush_message_batch(&mut pending_batch, &mut fanout_tasks).await;
+                    if let Some(existing) = pending_batch.iter_mut().find(|(t, _)| Arc::ptr_eq(t, &topic)) {
+                        existing.1.push(msg);
+                        if existing.1.len() >= BATCH_SIZE {
+                            let (t, msgs) = pending_batch.remove(pending_batch.iter().position(|(t_find, _)| Arc::ptr_eq(t_find, &topic)).unwrap());
+                            let _ = t.worker_tx.send(msgs).await;
+                        }
+                    } else {
+                        pending_batch.push((topic, vec![msg]));
                     }
                 }
             }
@@ -167,16 +216,9 @@ async fn handle_publish_connection(
         }
     }
 
-    if !pending_batch.is_empty() {
-        flush_message_batch(&mut pending_batch, &mut fanout_tasks).await;
-    }
-
-    // Crucially, we MUST await all spawned fan-out tasks to ensure the messages
-    // reach the subscriber channels before this producer handler exits.
-    while let Some(res) = fanout_tasks.join_next().await {
-        if let Err(e) = res {
-            tracing::error!("Fan-out task panicked: {}", e);
-        }
+    // Flush any remaining partial batches
+    for (topic, msgs) in pending_batch {
+        let _ = topic.worker_tx.send(msgs).await;
     }
 }
 
@@ -213,61 +255,6 @@ fn parse_and_create_message(
     Some((topic, message))
 }
 
-async fn flush_message_batch(batch: &mut Vec<(Arc<Topic>, Message)>, fanout_tasks: &mut tokio::task::JoinSet<()>) {
-    if batch.is_empty() {
-        return;
-    }
-
-    let mut groups: Vec<(Arc<Topic>, Vec<Message>)> = Vec::new();
-    for (topic, msg) in batch.drain(..) {
-        // Fast path: check if it belongs to the last group (common in 1-topic benchmarks)
-        if let Some(last) = groups.last_mut() {
-            if Arc::ptr_eq(&last.0, &topic) {
-                last.1.push(msg);
-                continue;
-            }
-        }
-        
-        // Slow path: find existing group
-        if let Some(existing) = groups.iter_mut().find(|(t, _)| Arc::ptr_eq(&t, &topic)) {
-            existing.1.push(msg);
-        } else {
-            groups.push((topic, vec![msg]));
-        }
-    }
-
-    for (topic, messages) in groups {
-        let subs = topic.subscribers.load().clone();
-        let topic_clone = topic.clone();
-        
-        fanout_tasks.spawn(async move {
-            // Encode ONCE per topic. Estimate 10KB per message for variable payloads to avoid reallocs.
-            let mut encoded_batch = BytesMut::with_capacity(messages.len() * 10240);
-            let topic_bytes = topic_clone.name.as_bytes();
-            let topic_len = topic_bytes.len() as u16;
-
-            for msg in messages {
-                let payload_len = msg.payload.len() as u16;
-                let total_len = 1 + 2 + topic_bytes.len() + 2 + msg.payload.len();
-
-                encoded_batch.put_u16(total_len as u16);
-                encoded_batch.put_u8(MSG_SUBSCRIBE_DATA);
-                encoded_batch.put_u16(topic_len);
-                encoded_batch.put_slice(topic_bytes);
-                encoded_batch.put_u16(payload_len);
-                encoded_batch.put_slice(&msg.payload);
-            }
-            
-            let final_batch = Arc::new(encoded_batch.freeze());
-            let dead_count = broadcast_to_subscribers(&subs, final_batch).await;
-            
-            if dead_count > 0 {
-                remove_dead_subscribers(&topic_clone, &subs, dead_count).await;
-            }
-        });
-    }
-}
-
 async fn broadcast_to_subscribers(subs: &Vec<mpsc::Sender<Arc<Bytes>>>, batch: Arc<Bytes>) -> usize {
     let mut dead_count = 0;
     for sub in subs.iter() {
@@ -284,7 +271,7 @@ async fn remove_dead_subscribers(topic: &Arc<Topic>, subs_snapshot: &Vec<mpsc::S
     // Use a CAS loop to ensures we don't overwrite other concurrent subscriber changes
     loop {
         let current = topic.subscribers.load();
-        // Remove any senders that are closed. We check the current list, not the snapshot.
+        // Remove any senders that are closed.
         let new_subs: Vec<_> = current.iter().cloned().filter(|s| !s.is_closed()).collect();
         let removed_this_time = current.len().saturating_sub(new_subs.len());
         
