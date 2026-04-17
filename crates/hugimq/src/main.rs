@@ -21,7 +21,7 @@ struct Message {
 }
 
 /// Per-subscriber bounded channel capacity (in batches).
-const SUBSCRIBER_CHANNEL_CAPACITY: usize = 4096;
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 16384;
 
 /// Read buffer size (64KB)
 const READ_BUF_SIZE: usize = 64 * 1024;
@@ -123,8 +123,8 @@ async fn handle_publish_connection(
 ) {
     let mut cache: Vec<(String, Arc<Topic>)> = Vec::with_capacity(4);
     let mut stream = stream;
-    let mut pending_batch: Vec<(Arc<Topic>, Message)> = Vec::with_capacity(512);
-    const BATCH_SIZE: usize = 512;
+    let mut pending_batch: Vec<(Arc<Topic>, Message)> = Vec::with_capacity(128);
+    const BATCH_SIZE: usize = 128;
     let mut fanout_tasks = tokio::task::JoinSet::new();
 
     if let Some((topic, msg)) = parse_and_create_message(Bytes::copy_from_slice(first_payload), &mut cache, &state) {
@@ -240,8 +240,8 @@ async fn flush_message_batch(batch: &mut Vec<(Arc<Topic>, Message)>, fanout_task
         let topic_clone = topic.clone();
         
         fanout_tasks.spawn(async move {
-            // Encode ONCE per topic
-            let mut encoded_batch = BytesMut::with_capacity(messages.len() * 150);
+            // Encode ONCE per topic. Estimate 10KB per message for variable payloads to avoid reallocs.
+            let mut encoded_batch = BytesMut::with_capacity(messages.len() * 10240);
             let topic_bytes = topic_clone.name.as_bytes();
             let topic_len = topic_bytes.len() as u16;
 
