@@ -10,10 +10,8 @@ from dotenv import load_dotenv
 import logging
 import argparse
 
-# Load environment variables from .env file
 load_dotenv()
 
-# --- Configuration ---
 AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
 AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
 AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
@@ -21,18 +19,18 @@ AMI_ID = os.getenv('AMI_ID', 'ami-0c7217cdde317cfec')
 KEY_NAME = os.getenv('KEY_NAME', 'hugimq-bench-key')
 KEY_PATH = os.getenv('KEY_PATH', './hugimq-bench-key.pem')
 
-# Validate required variables
 if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
     print("Error: AWS_ACCESS_KEY and AWS_SECRET_KEY must be set in your .env file.")
     sys.exit(1)
 
-# Instance Configurations
-BENCHMARKER_TYPE = 'c6i.2xlarge'
-TARGET_TYPE = 'c6i.xlarge'
+AMI_ID = 'ami-0ab515046786de9dc' # Ubuntu 22.04 ARM64
+BENCHMARKER_TYPE = 'hpc7g.8xlarge'
+TARGET_TYPE = 'hpc7g.4xlarge'
 SECURITY_GROUP_NAME = 'hugimq-bench-sg'
+PLACEMENT_GROUP_NAME = 'hugimq-cluster-pg'
 REPO_URL = os.getenv('REPO_URL', 'https://github.com/sgkandale/HugiMQ.git')
+SERVER_PORT = 6379
 
-# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -40,16 +38,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("cloud_bench")
 
-# --- Heartbeat to prevent CLI timeouts ---
 def heartbeat(stop_event):
     while not stop_event.is_set():
         time.sleep(30)
         if not stop_event.is_set():
-            # Print a single dot to stdout to maintain activity
             sys.stdout.write(".")
             sys.stdout.flush()
 
-# --- AWS Setup ---
 ec2 = boto3.client(
     'ec2',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -73,23 +68,7 @@ class InstanceManager:
                 return
             log.info(f"Terminating instances: {self.instances}")
             try:
-                response = ec2.terminate_instances(InstanceIds=self.instances)
-                for term in response.get('TerminatingInstances', []):
-                    log.info(f"Instance {term['InstanceId']} state: {term['CurrentState']['Name']}")
-                
-                # Wait up to 30 seconds for confirmation of shutting-down state
-                log.info("Waiting for AWS to confirm shutting-down status...")
-                for _ in range(6):
-                    time.sleep(5)
-                    try:
-                        check = ec2.describe_instances(InstanceIds=self.instances)
-                        states = [i['State']['Name'] for r in check['Reservations'] for i in r['Instances']]
-                        log.info(f"Current states: {states}")
-                        if all(s in ['shutting-down', 'terminated'] for s in states):
-                            break
-                    except:
-                        break
-                
+                ec2.terminate_instances(InstanceIds=self.instances)
                 self.instances = []
             except Exception as e:
                 log.error(f"Failed to terminate instances: {e}")
@@ -97,359 +76,207 @@ class InstanceManager:
 manager = InstanceManager()
 
 def cleanup_zombies():
-    """Finds and kills any HugiMQ-tagged instances from previous runs that are still alive."""
-    log.info("Checking for zombie instances from previous runs...")
     try:
         res = ec2.describe_instances(Filters=[
             {'Name': 'tag:Name', 'Values': ['HugiMQ-*']},
-            {'Name': 'instance-state-name', 'Values': ['running', 'pending', 'stopping', 'stopped']}
+            {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
         ])
         ids = [i['InstanceId'] for r in res['Reservations'] for i in r['Instances']]
         if ids:
-            log.warning(f"Found {len(ids)} zombie instances. Terminating: {ids}")
+            log.warning(f"Terminating zombies: {ids}")
             ec2.terminate_instances(InstanceIds=ids)
-            for i in ids: manager.add(i)
-            manager.terminate_all()
-        else:
-            log.info("No zombies found.")
-    except Exception as e:
-        log.error(f"Zombie cleanup failed: {e}")
+    except: pass
 
 def signal_handler(signum, frame):
-    log.info(f"Signal {signum} received. Cleaning up...")
     manager.terminate_all()
     sys.exit(1)
 
 signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 def create_key_pair():
-    aws_exists = False
-    try:
-        ec2.describe_key_pairs(KeyNames=[KEY_NAME])
-        aws_exists = True
-    except ClientError as e:
-        if 'InvalidKeyPair.NotFound' not in str(e):
-            raise e
-    
-    file_exists = os.path.exists(KEY_PATH)
-
-    if aws_exists:
-        if file_exists:
-            log.info(f"Key pair '{KEY_NAME}' and local file '{KEY_PATH}' already exist.")
-            os.chmod(KEY_PATH, 0o400)
-            return
-        else:
-            log.error(f"Error: Key pair '{KEY_NAME}' exists in AWS but local file '{KEY_PATH}' was not found.")
-            sys.exit(1)
-    else:
-        if file_exists:
-            log.error(f"Error: Local file '{KEY_PATH}' exists but key pair '{KEY_NAME}' does not exist in AWS.")
-            sys.exit(1)
-
+    try: ec2.describe_key_pairs(KeyNames=[KEY_NAME])
+    except ClientError:
         log.info(f"Creating key pair: {KEY_NAME}")
         response = ec2.create_key_pair(KeyName=KEY_NAME)
-        key_material = response['KeyMaterial']
-        
-        with open(KEY_PATH, 'w') as f:
-            f.write(key_material)
-        
+        with open(KEY_PATH, 'w') as f: f.write(response['KeyMaterial'])
         os.chmod(KEY_PATH, 0o400)
-        log.info(f"Key pair created and saved to {KEY_PATH}")
 
 def create_security_group():
     try:
-        response = ec2.create_security_group(
-            GroupName=SECURITY_GROUP_NAME,
-            Description='Security group for HugiMQ benchmarking'
-        )
+        response = ec2.create_security_group(GroupName=SECURITY_GROUP_NAME, Description='HugiMQ SG')
         sg_id = response['GroupId']
         ec2.authorize_security_group_ingress(
             GroupId=sg_id,
             IpPermissions=[
                 {'IpProtocol': 'tcp', 'FromPort': 22, 'ToPort': 22, 'IpRanges': [{'CidrIp': '0.0.0.0/0'}]},
-                {'IpProtocol': 'tcp', 'FromPort': 6379, 'ToPort': 6379, 'IpRanges': [{'CidrIp': '0.0.0.0/0'}]},
-                {'IpProtocol': 'udp', 'FromPort': 6379, 'ToPort': 6379, 'IpRanges': [{'CidrIp': '0.0.0.0/0'}]},
+                {'IpProtocol': 'tcp', 'FromPort': SERVER_PORT, 'ToPort': SERVER_PORT, 'IpRanges': [{'CidrIp': '0.0.0.0/0'}]},
             ]
         )
         return sg_id
-    except ClientError as e:
-        if 'InvalidGroup.Duplicate' in str(e):
-            response = ec2.describe_security_groups(GroupNames=[SECURITY_GROUP_NAME])
-            return response['SecurityGroups'][0]['GroupId']
-        raise e
+    except ClientError:
+        res = ec2.describe_security_groups(GroupNames=[SECURITY_GROUP_NAME])
+        return res['SecurityGroups'][0]['GroupId']
 
 def get_target_subnet(az=None):
-    vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
-    if not vpcs['Vpcs']:
-        subnets = ec2.describe_subnets()
-    else:
-        vpc_id = vpcs['Vpcs'][0]['VpcId']
-        subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])
-
-    if not subnets['Subnets']:
-        raise Exception("No subnets found in the target VPC.")
-
     if az:
-        for subnet in subnets['Subnets']:
-            if subnet['AvailabilityZone'] == az:
-                target = subnet
-                break
-        else:
-            raise Exception(f"No subnet found in AZ: {az}")
+        res = ec2.describe_subnets(Filters=[{'Name': 'availability-zone', 'Values': [az]}])
     else:
-        target = subnets['Subnets'][0]
-    
-    log.info(f"Targeting Subnet: {target['SubnetId']} ({target['AvailabilityZone']})")
-    return target['SubnetId']
+        res = ec2.describe_subnets()
+    if not res['Subnets']:
+        raise Exception(f"No subnets found in AZ {az}" if az else "No subnets found")
+    return res['Subnets'][0]['SubnetId']
 
-def request_spot_instance(instance_type, name, subnet_id):
-    log.info(f"Requesting {name} ({instance_type}) spot instance...")
-    response = ec2.run_instances(
-        ImageId=AMI_ID,
-        InstanceType=instance_type,
+def request_spot_instance(instance_type, name, subnet_id, sg_id):
+    log.info(f"Requesting Spot instance: {instance_type} ({name})")
+    res = ec2.run_instances(
+        ImageId=AMI_ID, 
+        InstanceType=instance_type, 
         KeyName=KEY_NAME,
-        SecurityGroupIds=[create_security_group()],
-        SubnetId=subnet_id,
-        InstanceMarketOptions={
-            'MarketType': 'spot',
-            'SpotOptions': {
-                'MaxPrice': '0.50',
-                'SpotInstanceType': 'one-time',
-                'InstanceInterruptionBehavior': 'terminate',
-            }
-        },
-        MinCount=1,
+        NetworkInterfaces=[{
+            'DeviceIndex': 0,
+            'SubnetId': subnet_id,
+            'Groups': [sg_id],
+            'AssociatePublicIpAddress': True
+        }],
+        Placement={'GroupName': PLACEMENT_GROUP_NAME},
+        InstanceMarketOptions={'MarketType': 'spot'}, 
+        MinCount=1, 
         MaxCount=1,
-        TagSpecifications=[{
-            'ResourceType': 'instance',
-            'Tags': [{'Key': 'Name', 'Value': name}]
-        }]
+        TagSpecifications=[{'ResourceType': 'instance', 'Tags': [{'Key': 'Name', 'Value': name}]}]
     )
-    instance_id = response['Instances'][0]['InstanceId']
+    instance_id = res['Instances'][0]['InstanceId']
     manager.add(instance_id)
     return instance_id
 
-def wait_for_instance(instance_id, stop_event):
-    log.info(f"Waiting for {instance_id} to be ready...")
-    while not stop_event.is_set():
-        response = ec2.describe_instances(InstanceIds=[instance_id])
-        state = response['Reservations'][0]['Instances'][0]['State']['Name']
-        if state == 'running':
-            break
-        time.sleep(5)
-    
-    status_waiter = ec2.get_waiter('instance_status_ok')
-    status_waiter.wait(InstanceIds=[instance_id])
-    
-    response = ec2.describe_instances(InstanceIds=[instance_id])
-    instance = response['Reservations'][0]['Instances'][0]
+def request_ondemand_instance(instance_type, name, subnet_id, sg_id):
+    log.info(f"Requesting On-Demand instance: {instance_type} ({name})")
+    res = ec2.run_instances(
+        ImageId=AMI_ID, 
+        InstanceType=instance_type, 
+        KeyName=KEY_NAME,
+        NetworkInterfaces=[{
+            'DeviceIndex': 0,
+            'SubnetId': subnet_id,
+            'Groups': [sg_id],
+            'AssociatePublicIpAddress': True
+        }],
+        Placement={'GroupName': PLACEMENT_GROUP_NAME},
+        MinCount=1, 
+        MaxCount=1,
+        TagSpecifications=[{'ResourceType': 'instance', 'Tags': [{'Key': 'Name', 'Value': name}]}]
+    )
+    instance_id = res['Instances'][0]['InstanceId']
+    manager.add(instance_id)
+    return instance_id
+
+def wait_for_instance(instance_id):
+    log.info(f"Waiting for {instance_id}...")
+    waiter = ec2.get_waiter('instance_status_ok')
+    waiter.wait(InstanceIds=[instance_id])
+    res = ec2.describe_instances(InstanceIds=[instance_id])
+    instance = res['Reservations'][0]['Instances'][0]
     return instance['PublicIpAddress'], instance['PrivateIpAddress']
 
 def run_ssh_commands(ip, commands, prefix, stop_event):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    
-    connected = False
-    for i in range(20):
-        if stop_event.is_set(): return
+    for i in range(10):
         try:
             client.connect(hostname=ip, username='ubuntu', key_filename=KEY_PATH, timeout=10)
-            connected = True
             break
-        except Exception:
-            log.info(f"[{prefix}] Retrying SSH connection to {ip}... ({i+1}/20)")
-            time.sleep(10)
+        except: time.sleep(10)
     
-    if not connected:
-        raise Exception(f"Failed to connect to {ip}")
-
     for cmd in commands:
         if stop_event.is_set(): break
-        log.info(f"[{prefix}] Executing: {cmd}")
         stdin, stdout, stderr = client.exec_command(cmd)
-        
-        def pipe_stream(stream, is_stderr=False):
-            for line in stream:
-                if stop_event.is_set(): break
-                if is_stderr:
-                    log.warning(f"[{prefix}] [STDERR] {line.strip()}")
-                else:
-                    log.info(f"[{prefix}] {line.strip()}")
-
-        t1 = threading.Thread(target=pipe_stream, args=(stdout,))
-        t2 = threading.Thread(target=pipe_stream, args=(stderr, True))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-        
-        exit_status = stdout.channel.recv_exit_status()
-        if exit_status != 0:
-            log.error(f"[{prefix}] Command failed with status {exit_status}.")
-            raise Exception(f"Command failed on {ip}")
-            
+        for line in stdout: log.info(f"[{prefix}] {line.strip()}")
+        for line in stderr: log.warning(f"[{prefix}] [ERR] {line.strip()}")
     client.close()
 
+def create_placement_group():
+    try:
+        log.info(f"Creating placement group: {PLACEMENT_GROUP_NAME}")
+        ec2.create_placement_group(GroupName=PLACEMENT_GROUP_NAME, Strategy='cluster')
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'InvalidPlacementGroup.Duplicate':
+            log.error(f"Failed to create placement group: {e}")
+
 def main():
-    parser = argparse.ArgumentParser(description="Cloud Benchmarker for HugiMQ and Redis")
-    parser.add_argument("target", choices=["redis", "hugimq", "hugimqws", "hugimqtcp", "hugimqudp"], help="Benchmark target")
-    parser.add_argument("--connections", type=int, default=20, help="Number of connections")
-    parser.add_argument("--messages", type=int, default=50000, help="Messages per connection")
-    parser.add_argument("--payload", type=int, default=128, help="Payload size in bytes")
-    parser.add_argument("--az", type=str, default=None, help="Availability Zone (e.g., us-east-1b)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target", choices=["tcp", "redis"], default="tcp")
+    parser.add_argument("--connections", type=int, default=20)
+    parser.add_argument("--topics", type=int, default=1)
+    parser.add_argument("--messages-per-conn", type=int, default=100000)
+    parser.add_argument("--payload-size", type=int, default=128)
+    parser.add_argument("--az", type=str, help="AWS Availability Zone")
+    parser.add_argument("--variable-payload", action="store_true", help="Enable variable payload size (512B-10KB)")
     args = parser.parse_args()
 
     stop_event = threading.Event()
-
-    # Start heartbeat thread
-    hb = threading.Thread(target=heartbeat, args=(stop_event,), daemon=True)
-    hb.start()
+    threading.Thread(target=heartbeat, args=(stop_event,), daemon=True).start()
 
     try:
         cleanup_zombies()
         create_key_pair()
-        subnet_id = get_target_subnet(args.az)
-        target_id = request_spot_instance(TARGET_TYPE, f'HugiMQ-Target-{args.target}', subnet_id)
-        bench_id = request_spot_instance(BENCHMARKER_TYPE, 'HugiMQ-Benchmarker', subnet_id)
+        create_placement_group()
+        sg_id = create_security_group()
+        sub_id = get_target_subnet(args.az)
         
-        ips = {}
-        def get_ips(id, key):
-            ips[key] = wait_for_instance(id, stop_event)
-
-        t1 = threading.Thread(target=get_ips, args=(target_id, 'target'))
-        t2 = threading.Thread(target=get_ips, args=(bench_id, 'bench'))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
-        target_pub, target_priv = ips['target']
-        bench_pub, bench_priv = ips['bench']
+        # server_id = request_spot_instance(TARGET_TYPE, 'HugiMQ-Server', sub_id, sg_id)
+        # bench_id = request_spot_instance(BENCHMARKER_TYPE, 'HugiMQ-Bench', sub_id, sg_id)
         
-        log.info(f"Target Instance (Public: {target_pub}, Private: {target_priv})")
-        log.info(f"Benchmarker Instance (Public: {bench_pub}, Private: {bench_priv})")
+        server_id = request_ondemand_instance(TARGET_TYPE, 'HugiMQ-Server', sub_id, sg_id)
+        bench_id = request_ondemand_instance(BENCHMARKER_TYPE, 'HugiMQ-Bench', sub_id, sg_id)
+        
+        server_pub, server_priv = wait_for_instance(server_id)
+        bench_pub, bench_priv = wait_for_instance(bench_id)
 
-        common_setup = [
-            "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get update",
-            "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get install -y build-essential curl git pkg-config libssl-dev protobuf-compiler uuid-dev python3-pip libclang-dev libbsd-dev",
-            "pip3 install --user cmake",
-            "export PATH=$HOME/.local/bin:$PATH && cmake --version",
+        log.info(f"Server: {server_pub} ({server_priv})")
+        log.info(f"Benchmarker: {bench_pub} ({bench_priv})")
+
+        setup_cmds = [
+            "sudo apt-get update && sudo apt-get install -y build-essential git curl pkg-config libssl-dev",
             "if ! command -v cargo &> /dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi",
-            f"source $HOME/.cargo/env && if [ ! -d 'HugiMQ' ]; then git clone {REPO_URL} HugiMQ; else cd HugiMQ && git pull; fi"
+            f"rm -rf HugiMQ && git clone {REPO_URL} HugiMQ && cd HugiMQ && source $HOME/.cargo/env && cargo build --release"
         ]
 
         if args.target == "redis":
-            target_setup = [
-                "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get update",
-                "export DEBIAN_FRONTEND=noninteractive && sudo -E apt-get install -y redis-server",
-                "sudo sed -i 's/bind 127.0.0.1/bind 0.0.0.0/' /etc/redis/redis.conf && " + \
-                "sudo sed -i 's/protected-mode yes/protected-mode no/' /etc/redis/redis.conf && " + \
-                "sudo sed -i 's/# io-threads 4/io-threads 2/' /etc/redis/redis.conf && " + \
-                "sudo sed -i 's/# io-threads-do-reads no/io-threads-do-reads yes/' /etc/redis/redis.conf && " + \
-                "sudo systemctl restart redis-server"
+            redis_setup = [
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get update",
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server",
+                "echo 'bind 0.0.0.0' | sudo tee /etc/redis/redis.conf",
+                "echo 'protected-mode no' | sudo tee -a /etc/redis/redis.conf",
+                "echo 'port 6379' | sudo tee -a /etc/redis/redis.conf",
+                "sudo systemctl restart redis-server",
+                "sleep 2",
+                "ss -ln | grep 6379"
             ]
-        elif args.target == "hugimqudp":
-            # Aeron UDP: needs PATH for pip-installed cmake
-            target_setup = common_setup + [
-                "export PATH=$HOME/.local/bin:$PATH && source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p hugimq"
-            ]
+            t1 = threading.Thread(target=run_ssh_commands, args=(server_pub, redis_setup, "REDIS-SETUP", stop_event))
         else:
-            target_setup = common_setup + [
-                "source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p hugimq"
-            ]
+            t1 = threading.Thread(target=run_ssh_commands, args=(server_pub, setup_cmds, "SERVER-SETUP", stop_event))
+            
+        t2 = threading.Thread(target=run_ssh_commands, args=(bench_pub, setup_cmds, "BENCH-SETUP", stop_event))
+        t1.start(); t2.start(); t1.join(); t2.join()
 
-        # Aeron benchmarker also needs PATH for cmake
-        if args.target == "hugimqudp":
-            bench_setup = common_setup + [
-                "export PATH=$HOME/.local/bin:$PATH && source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p benchmarker"
-            ]
-        else:
-            bench_setup = common_setup + [
-                "source $HOME/.cargo/env && cd HugiMQ && cargo build --release -p benchmarker"
-            ]
-
-        log.info("Starting instance setup...")
-        t1 = threading.Thread(target=run_ssh_commands, args=(target_pub, target_setup, "TARGET-SETUP", stop_event))
-        t2 = threading.Thread(target=run_ssh_commands, args=(bench_pub, bench_setup, "BENCH-SETUP", stop_event))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
-        if stop_event.is_set(): return
-
-        if args.target == "hugimq":
-            log.info("Starting HugiMQ server on target instance...")
-            run_ssh_commands(target_pub, [
-                "ls -la $HOME/HugiMQ/target/release/hugimq-server",
-                "source $HOME/.cargo/env && (nohup $HOME/HugiMQ/target/release/hugimq-server > $HOME/hugimq.log 2>&1 < /dev/null &)",
-                "sleep 10 && (pgrep hugimq-server || (echo '--- LOG START ---' && cat $HOME/hugimq.log && echo '--- LOG END ---' && exit 1))"
-            ], "HUGIMQ-START", stop_event)
-        elif args.target == "hugimqws":
-            log.info("Starting HugiMQ WebSocket server on target instance...")
-            run_ssh_commands(target_pub, [
-                "ls -la $HOME/HugiMQ/target/release/hugimq-server",
-                "source $HOME/.cargo/env && (nohup $HOME/HugiMQ/target/release/hugimq-server > $HOME/hugimq.log 2>&1 < /dev/null &)",
-                "sleep 10 && (pgrep hugimq-server || (echo '--- LOG START ---' && cat $HOME/hugimq.log && echo '--- LOG END ---' && exit 1))"
-            ], "HUGIMQWS-START", stop_event)
-        elif args.target == "hugimqtcp":
-            log.info("Starting HugiMQ TCP server on target instance...")
-            run_ssh_commands(target_pub, [
-                "ls -la $HOME/HugiMQ/target/release/hugimq-server",
-                "source $HOME/.cargo/env && (nohup $HOME/HugiMQ/target/release/hugimq-server > $HOME/hugimq.log 2>&1 < /dev/null &)",
-                "sleep 10 && (pgrep hugimq-server || (echo '--- LOG START ---' && cat $HOME/hugimq.log && echo '--- LOG END ---' && exit 1))"
-            ], "HUGIMQTCP-START", stop_event)
-        elif args.target == "hugimqudp":
-            log.info("Starting HugiMQ Aeron UDP server on target instance...")
-            run_ssh_commands(target_pub, [
-                "ls -la $HOME/HugiMQ/target/release/hugimq-server",
-                "AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && sudo ldconfig $AERON_LIB && source $HOME/.cargo/env && (nohup $HOME/HugiMQ/target/release/hugimq-server > $HOME/hugimq.log 2>&1 < /dev/null &)",
-                "sleep 10 && (pgrep hugimq-server || (echo '--- LOG START ---' && cat $HOME/hugimq.log && echo '--- LOG END ---' && exit 1))"
-            ], "HUGIMQUDP-START", stop_event)
-
-        # Run Benchmark
-        log.info(f"Running benchmark against {args.target}...")
-
+        server_url = f"tcp://{server_priv}:{SERVER_PORT}"
         if args.target == "redis":
-            url_flag = f"--redis-url redis://{target_priv}:6379/"
-            bench_target = args.target
-        elif args.target == "hugimqws":
-            url_flag = f"--hugimq-ws-url ws://{target_priv}:6379"
-            bench_target = args.target
-        elif args.target == "hugimqtcp":
-            url_flag = f"--url tcp://{target_priv}:6379"
-            bench_target = "tcp"
-        elif args.target == "hugimqudp":
-            # Aeron benchmarker uses -s for server IP, no --url or positional target
-            url_flag = f"-s {target_priv}"
-            bench_target = ""  # No positional arg needed
-        else:
-            url_flag = f"--hugimq-url http://{target_priv}:6379"
-            bench_target = args.target
-
-        if args.target == "hugimqudp":
-            benchmark_cmd = [
-                f"AERON_LIB=$(find $HOME/HugiMQ/target/release/build -name 'libaeron_driver.so' -printf '%h\n' | head -1) && sudo ldconfig $AERON_LIB && source $HOME/.cargo/env && cd HugiMQ && " + \
-                f"./target/release/benchmarker " + \
-                f"--connections {args.connections} --messages-per-conn {args.messages} --payload-size {args.payload} " + \
-                f"{url_flag}"
+            server_url = f"redis://{server_priv}:{SERVER_PORT}"
+        
+        if args.target == "tcp":
+            server_run = [
+                f"source $HOME/.cargo/env && cd HugiMQ && (nohup ./target/release/hugimq-server > server.log 2>&1 &)",
+                "sleep 2"
             ]
-        else:
-            benchmark_cmd = [
-                f"source $HOME/.cargo/env && cd HugiMQ && ./target/release/benchmarker {bench_target} " + \
-                f"--connections {args.connections} --messages-per-conn {args.messages} --payload-size {args.payload} " + \
-                f"{url_flag}"
-            ]
+            run_ssh_commands(server_pub, server_run, "SERVER-RUN", stop_event)
 
-        run_ssh_commands(bench_pub, benchmark_cmd, "BENCHMARK-RUN", stop_event)
-        log.info("Benchmark complete.")
+        var_flag = "--variable-payload" if args.variable_payload else ""
+        bench_run = [
+            f"source $HOME/.cargo/env && cd HugiMQ && ./target/release/benchmarker {args.target} --url {server_url} --connections {args.connections} --topics {args.topics} --messages-per-conn {args.messages_per_conn} --payload-size {args.payload_size} {var_flag}"
+        ]
+        run_ssh_commands(bench_pub, bench_run, "BENCH-RUN", stop_event)
 
-    except Exception as e:
-        log.error(f"Error occurred: {e}")
     finally:
         stop_event.set()
         manager.terminate_all()
 
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()
